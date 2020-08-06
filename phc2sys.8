@@ -86,6 +86,18 @@ compatible with the
 .B \-a
 option.
 .TP
+.BI \-g " gpio-file"
+Specify the GPIO pseudo-file to use to latch master+slave hardware clock times.
+In this use case,
+.B phc2sys
+will write
+.B 1
+to the file, then
+.B 0
+and then read latched 64-bit nanosecond timestamps out of the source and slave
+clock devices. As always, slave clocks will be steered to minimize the
+difference with the master clock.
+.TP
 .BI \-s " device"
 Specify the master clock by device (e.g. /dev/ptp0) or interface (e.g. eth0) or
 by name (e.g. CLOCK_REALTIME for the system clock). When this option is used
@@ -280,7 +292,7 @@ does not wait for
 .BR ptp4l .
 
 .RS
-\f(CWphc2sys \-c /dev/ptp0 \-s CLOCK_REALTIME \-O 35\fP
+\f(CWphc2sys \-c /dev/ptp0 \-s CLOCK_REALTIME \-O 36\fP
 .RE
 
 The host is in slave mode, system clock is synchronized from PTP clock,
@@ -299,7 +311,7 @@ provided on command line
 does not wait.
 
 .RS
-\f(CWphc2sys \-s eth0 \-O \-35\fP
+\f(CWphc2sys \-s eth0 \-O \-36\fP
 .RE
 
 .SH SEE ALSO

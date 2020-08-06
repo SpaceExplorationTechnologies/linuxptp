@@ -29,6 +29,7 @@
 #include <ifaddrs.h>
 #include <stdlib.h>
 #include <poll.h>
+#include <time.h>
 
 #include "address.h"
 #include "ether.h"
@@ -97,8 +98,9 @@ int sk_interface_index(int fd, const char *name)
 
 int sk_general_init(int fd)
 {
-	int on = sk_check_fupsync ? 1 : 0;
-	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) < 0) {
+	const int on = 1;
+	if (sk_check_fupsync &&
+	    setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) < 0) {
 		pr_err("ioctl SO_TIMESTAMPNS failed: %m");
 		return -1;
 	}
@@ -220,7 +222,6 @@ int sk_receive(int fd, void *buf, int buflen,
 	struct cmsghdr *cm;
 	struct iovec iov = { buf, buflen };
 	struct msghdr msg;
-	struct timespec *sw, *ts = NULL;
 
 	memset(control, 0, sizeof(control));
 	memset(&msg, 0, sizeof(msg));
@@ -235,6 +236,34 @@ int sk_receive(int fd, void *buf, int buflen,
 
 	if (flags == MSG_ERRQUEUE) {
 		struct pollfd pfd = { fd, sk_events, 0 };
+
+		/*
+		 * We reach this point right after sending a packet to the
+		 * kernel. We therefore grab an imprecise timestamp right away
+		 * in the case where we have requested legacy software
+		 * timestamping (which does not timestamp transmitted packets).
+		 * Note that getting CLOCK_REALTIME should be very quick.
+		 * It will have much more jitter than one sampled right
+		 * before the packet hits the hardware (which is what the
+		 * driver should do when real software timestamping is
+		 * requested).
+		 * Note that we only manually grab the time for the
+		 * transmit-timestamp path (flags == MSG_ERRQUEUE); Linux
+		 * kernels have supported receive timestamping for much longer.
+		 */
+		if (hwts->type == TS_LEGACY_SW) {
+			struct timespec userspace_ts = { 0, 0 };
+
+			clock_gettime(CLOCK_REALTIME, &userspace_ts);
+			hwts->ts = userspace_ts;
+			/*
+			 * Callers do not care about the magnitude of
+			 * the return value in this case -- just that
+			 * it's >0.
+			 */
+			return 1;
+		}
+
 		res = poll(&pfd, 1, sk_tx_timeout);
 		if (res < 1) {
 			pr_err(res ? "poll for tx timestamp failed: %m" :
@@ -253,46 +282,57 @@ int sk_receive(int fd, void *buf, int buflen,
 		pr_err("recvmsg%sfailed: %m",
 		       flags == MSG_ERRQUEUE ? " tx timestamp " : " ");
 
+	/* Clear out the provided timestamp buffer. If the kernel did not
+	 * associate a timestamp with message (see the CMSG processing below),
+	 * the caller will know the timestamp retrieval failed. */
+	memset(&hwts->ts, 0, sizeof(hwts->ts));
+
 	for (cm = CMSG_FIRSTHDR(&msg); cm != NULL; cm = CMSG_NXTHDR(&msg, cm)) {
 		level = cm->cmsg_level;
 		type  = cm->cmsg_type;
 		if (SOL_SOCKET == level && SO_TIMESTAMPING == type) {
+			struct timespec *ts;
+
 			if (cm->cmsg_len < sizeof(*ts) * 3) {
 				pr_warning("short SO_TIMESTAMPING message");
 				return -1;
 			}
 			ts = (struct timespec *) CMSG_DATA(cm);
+			switch (hwts->type) {
+			case TS_SOFTWARE:
+				hwts->ts = ts[0];
+				break;
+			case TS_HARDWARE:
+			case TS_ONESTEP:
+				hwts->ts = ts[2];
+				break;
+			case TS_LEGACY_HW:
+				hwts->ts = ts[1];
+				break;
+			case TS_LEGACY_SW:
+				pr_debug("received an SO_TIMESTAMPING message, "
+					 "but we're using legacy_sw "
+					 "timestamping (SO_TIMESTAMPNS)");
+				break;
+			}
 		}
 		if (SOL_SOCKET == level && SO_TIMESTAMPNS == type) {
+			struct timespec *sw;
+
 			if (cm->cmsg_len < sizeof(*sw)) {
 				pr_warning("short SO_TIMESTAMPNS message");
 				return -1;
 			}
 			sw = (struct timespec *) CMSG_DATA(cm);
 			hwts->sw = *sw;
+			if (hwts->type == TS_LEGACY_SW)
+				hwts->ts = hwts->sw;
 		}
 	}
 
 	if (addr)
 		addr->len = msg.msg_namelen;
 
-	if (!ts) {
-		memset(&hwts->ts, 0, sizeof(hwts->ts));
-		return cnt;
-	}
-
-	switch (hwts->type) {
-	case TS_SOFTWARE:
-		hwts->ts = ts[0];
-		break;
-	case TS_HARDWARE:
-	case TS_ONESTEP:
-		hwts->ts = ts[2];
-		break;
-	case TS_LEGACY_HW:
-		hwts->ts = ts[1];
-		break;
-	}
 	return cnt;
 }
 
@@ -318,11 +358,14 @@ int sk_timestamping_init(int fd, const char *device, enum timestamp_type type,
 			SOF_TIMESTAMPING_RX_HARDWARE |
 			SOF_TIMESTAMPING_SYS_HARDWARE;
 		break;
+	case TS_LEGACY_SW:
+		flags = 1;
+		break;
 	default:
 		return -1;
 	}
 
-	if (type != TS_SOFTWARE) {
+	if (!timestamping_is_software(type)) {
 		filter1 = HWTSTAMP_FILTER_PTP_V2_EVENT;
 		one_step = type == TS_ONESTEP ? 1 : 0;
 		switch (transport) {
@@ -350,16 +393,24 @@ int sk_timestamping_init(int fd, const char *device, enum timestamp_type type,
 		}
 	}
 
-	if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
-		       &flags, sizeof(flags)) < 0) {
-		pr_err("ioctl SO_TIMESTAMPING failed: %m");
-		return -1;
+	if (type != TS_LEGACY_SW) {
+		if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
+			       &flags, sizeof(flags)) < 0) {
+			pr_err("ioctl SO_TIMESTAMPING failed: %m");
+			return -1;
+		}
+	} else {
+		if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS,
+			       &flags, sizeof(flags)) < 0) {
+			pr_err("ioctl SO_TIMESTAMPNS failed: %m");
+			return -1;
+		}
 	}
 
 	flags = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_SELECT_ERR_QUEUE,
 		       &flags, sizeof(flags)) < 0) {
-		pr_warning("%s: SO_SELECT_ERR_QUEUE: %m", device);
+		pr_notice("%s: SO_SELECT_ERR_QUEUE: %m", device);
 		sk_events = 0;
 		sk_revents = POLLERR;
 	}

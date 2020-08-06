@@ -19,7 +19,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/filter.h>
-#include <linux/if_ether.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -39,6 +38,7 @@
 #include "address.h"
 #include "contain.h"
 #include "ether.h"
+#include "missing.h"
 #include "print.h"
 #include "raw.h"
 #include "sk.h"

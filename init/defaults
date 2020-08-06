@@ -1,0 +1,22 @@
+# Options to pass to ptp4l
+
+# Only start by default on >= 16.04.
+START_DAEMON=$(lsb_release -rs | awk '{ print ($1 > 16) ? "yes" : "no" }')
+
+# Find all vehicle interfaces
+INTERFACES=$(ip addr show to "172.16.0.0/12" | awk '$1 == "inet" { print "-i", $NF }' | sort)
+
+# Default config file
+CONFIG_FILE="-f /etc/ptp4l.cfg"
+
+# Default PTP clock
+PTP_CLOCK="-p CLOCK_REALTIME"
+
+# Default stats files
+STATS_FILES="-t /run/linuxptp-stats.txt -T /run/linuxptp.tmp"
+
+# Default leap second flags
+UTC_OFFSET="-Z /usr/share/zoneinfo/right/Etc/UTC"
+
+# OPTIONS are appended to the ptp4l command-line
+OPTIONS="$CONFIG_FILE $PTP_CLOCK $STATS_FILES $UTC_OFFSET $INTERFACES"

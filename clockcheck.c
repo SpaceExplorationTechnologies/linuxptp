@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include "clockcheck.h"
+#include "missing.h"
 #include "print.h"
 
 #define CHECK_MIN_INTERVAL 100000000
@@ -73,7 +74,17 @@ int clockcheck_sample(struct clockcheck *cc, uint64_t ts)
 	if (interval >= 0 && interval < CHECK_MIN_INTERVAL)
 		return ret;
 
-	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) != 0) {
+		static int warned = 0;
+		if (!warned) {
+			pr_warning("clockcheck: no CLOCK_MONOTONIC_RAW; "
+				   "trying CLOCK_MONOTONIC (will be less "
+				   "accurate if system clock is being "
+				   "steered)!");
+			warned = 1;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &now);
+	}
 	mono_ts = now.tv_sec * 1000000000LL + now.tv_nsec;
 	mono_interval = (int64_t)mono_ts - cc->last_mono_ts;
 

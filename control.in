@@ -1,0 +1,10 @@
+
+Package: linuxptp-sx
+Version: [filled by package script]
+Section: base
+Priority: optional
+Architecture: [filled by package script]
+Depends: libgpstime-sx0
+Conflicts: linuxptp
+Maintainer: OS Platform Software <os-platform-software@spacex.com>
+Description: (SpaceX) An implementation of the Precision Time Protocol (PTP) according to IEEE standard 1588 for Linux.

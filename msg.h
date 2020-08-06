@@ -60,7 +60,19 @@ enum timestamp_type {
 	TS_HARDWARE,
 	TS_LEGACY_HW,
 	TS_ONESTEP,
+	TS_LEGACY_SW,
 };
+
+/**
+ * Returns true if we are using a form of software timestamping.
+ *
+ * @param tst  A timestamping type.
+ * @return     True if we are using a form of software timestamping.
+ */
+static inline uint8_t timestamping_is_software(enum timestamp_type tst)
+{
+	return (tst == TS_SOFTWARE) || (tst == TS_LEGACY_SW);
+}
 
 struct hw_timestamp {
 	enum timestamp_type type;
@@ -168,6 +180,35 @@ struct message_data {
 	uint8_t buffer[1500];
 } PACKED;
 
+/**
+ * struct sx_timestamp - nanosecond-scale timestamp (wire format)
+ *
+ * Note that while this looks a lot like 'struct timestamp' from
+ * ddt.h, this version is PACKED and hence safe for unpacking
+ * data structures from the wire.
+ */
+struct sx_timestamp {
+	Integer64           seconds;
+	UInteger32          nanoseconds;
+} PACKED;
+
+struct sx_message {
+	UInteger16          sx;
+	UInteger8           reserved_1;
+	UInteger8           clockClass;
+	struct sx_timestamp source_timestamp;
+	struct sx_timestamp local_clock_timestamp;
+	UInteger8           grandmasterPriority1;
+	UInteger8           grandmasterPriority2;
+	UInteger8           clock_identifier[2];
+	UInteger16          offsetScaledLogVariance;
+	Enumeration8        clockAccuracy;
+	Enumeration8        timeSource;
+	Integer16           currentUtcOffset;
+	UInteger8           leap59;
+	UInteger8           leap61;
+} PACKED;
+
 struct ptp_message {
 	union {
 		struct ptp_header          header;
@@ -182,6 +223,7 @@ struct ptp_message {
 		struct signaling_msg       signaling;
 		struct management_msg      management;
 		struct message_data        data;
+		struct sx_message          sx_msg;
 	} PACKED;
 	/**/
 	int tail_room;

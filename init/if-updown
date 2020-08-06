@@ -1,0 +1,8 @@
+#!/bin/sh
+
+. /etc/default/ptp4l
+
+# Restart ptp4l whenever we change an interface.
+if [ "$START_DAEMON" = "yes" ]; then
+	systemctl try-reload-or-restart ptp4l
+fi

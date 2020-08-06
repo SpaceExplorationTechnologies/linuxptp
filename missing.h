@@ -44,6 +44,10 @@
 #define CLOCK_INVALID -1
 #endif
 
+#ifndef CLOCK_MONOTONIC_RAW
+#define CLOCK_MONOTONIC_RAW 4
+#endif
+
 #define CLOCKFD 3
 #define FD_TO_CLOCKID(fd)	((~(clockid_t) (fd) << 3) | CLOCKFD)
 #define CLOCKID_TO_FD(clk)	((unsigned int) ~((clk) >> 3))
@@ -54,15 +58,42 @@ enum _missing_hwtstamp_tx_types {
 };
 #endif
 
+#ifndef HWTSTAMP_TX_ONESTEP_SYNC
+   #define HWTSTAMP_TX_ONESTEP_SYNC HWTSTAMP_TX_ON
+#endif
+
+#ifndef SIOCSHWTSTAMP
+#define SIOCSHWTSTAMP 0x89b0
+#endif
+
 #ifndef SIOCGHWTSTAMP
 #define SIOCGHWTSTAMP 0x89b1
+#endif
+
+#ifndef SO_TIMESTAMPING
+#define SO_TIMESTAMPING 37
 #endif
 
 #ifndef SO_SELECT_ERR_QUEUE
 #define SO_SELECT_ERR_QUEUE 45
 #endif
 
+#ifndef ETH_P_1588
+#define ETH_P_1588 0x88F7
+#endif
+
 #ifndef HAVE_CLOCK_ADJTIME
+
+#ifndef __NR_clock_adjtime
+	#ifdef __i386__
+		#define __NR_clock_adjtime	343
+	#endif
+
+	#ifdef _ASM_POWERPC_UNISTD_H_
+		#define __NR_clock_adjtime	347
+	#endif
+#endif
+
 static inline int clock_adjtime(clockid_t id, struct timex *tx)
 {
 	return syscall(__NR_clock_adjtime, id, tx);

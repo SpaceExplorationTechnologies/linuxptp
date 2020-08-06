@@ -41,15 +41,19 @@ static int phc_get_caps(clockid_t clkid, struct ptp_clock_caps *caps);
 clockid_t phc_open(char *phc)
 {
 	clockid_t clkid;
-	struct ptp_clock_caps caps;
+	struct timex tx = {};
 	int fd = open(phc, O_RDWR);
 
 	if (fd < 0)
 		return CLOCK_INVALID;
 
 	clkid = FD_TO_CLOCKID(fd);
-	/* check if clkid is valid */
-	if (phc_get_caps(clkid, &caps)) {
+	/*
+	 * Clocks are controlled through clock_adjtime(), so check if this
+	 * device supports it. No settings are changed because no 'tx.modes'
+	 * flags are set.
+         */
+	if (clock_adjtime(clkid, &tx)) {
 		close(fd);
 		return CLOCK_INVALID;
 	}
@@ -67,12 +71,9 @@ void phc_close(clockid_t clkid)
 
 static int phc_get_caps(clockid_t clkid, struct ptp_clock_caps *caps)
 {
-	int fd = CLOCKID_TO_FD(clkid), err;
+	int fd = CLOCKID_TO_FD(clkid);
 
-	err = ioctl(fd, PTP_CLOCK_GETCAPS, caps);
-	if (err)
-		perror("PTP_CLOCK_GETCAPS");
-	return err;
+	return ioctl(fd, PTP_CLOCK_GETCAPS, caps);
 }
 
 int phc_max_adj(clockid_t clkid)
@@ -80,8 +81,14 @@ int phc_max_adj(clockid_t clkid)
 	int max;
 	struct ptp_clock_caps caps;
 
-	if (phc_get_caps(clkid, &caps))
-		return 0;
+	if (phc_get_caps(clkid, &caps)) {
+		/* 
+		 * A device may support the POSIX clock but not the PTP 
+		 * interfaces. In that case, assume the maximum adjustment that
+		 * a struct timex can hold.
+		 */
+		return MAX_PPB_32;
+	}
 
 	max = caps.max_adj;
 

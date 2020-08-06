@@ -31,9 +31,17 @@ static int realtime_leap_bit;
 static long realtime_hz;
 static long realtime_nominal_tick;
 
+static int clock_adjtime_wrapper(clockid_t clkid, struct timex *tx)
+{
+	if (clkid == CLOCK_REALTIME)
+		return adjtimex(tx);
+	else
+		return clock_adjtime(clkid, tx);
+}
+
 void clockadj_init(clockid_t clkid)
 {
-#ifdef _SC_CLK_TCK
+#if defined(_SC_CLK_TCK) && defined(CLOCKADJ_WANT_ADJ_TICK)
 	if (clkid == CLOCK_REALTIME) {
 		/* This is USER_HZ in the kernel. */
 		realtime_hz = sysconf(_SC_CLK_TCK);
@@ -60,7 +68,7 @@ void clockadj_set_freq(clockid_t clkid, double freq)
 
 	tx.modes |= ADJ_FREQUENCY;
 	tx.freq = (long) (freq * 65.536);
-	if (clock_adjtime(clkid, &tx) < 0)
+	if (clock_adjtime_wrapper(clkid, &tx) < 0)
 		pr_err("failed to adjust the clock: %m");
 }
 
@@ -69,8 +77,17 @@ double clockadj_get_freq(clockid_t clkid)
 	double f = 0.0;
 	struct timex tx;
 	memset(&tx, 0, sizeof(tx));
-	if (clock_adjtime(clkid, &tx) < 0) {
+	if (clock_adjtime_wrapper(clkid, &tx) < 0) {
 		pr_err("failed to read out the clock frequency adjustment: %m");
+	} else if (clkid == CLOCK_REALTIME && !tx.tick) {
+		/*
+		 * There is a known issue with some Linux kernel versions where
+		 * clock_adjtime(CLOCK_REALTIME) does *not* behave exactly like
+		 * adjtimex() -- it does not return a valid 'struct timex' if
+		 * the clock state is not 0 (TIME_OK).
+		 */
+		pr_notice("clock_adjtime(CLOCK_REALTIME) did not return valid "
+			  "data; assuming 0.0 frequency adjustment");
 	} else {
 		f = tx.freq / 65.536;
 		if (clkid == CLOCK_REALTIME && realtime_nominal_tick)
@@ -99,7 +116,7 @@ void clockadj_step(clockid_t clkid, int64_t step)
 		tx.time.tv_sec  -= 1;
 		tx.time.tv_usec += 1000000000;
 	}
-	if (clock_adjtime(clkid, &tx) < 0)
+	if (clock_adjtime_wrapper(clkid, &tx) < 0)
 		pr_err("failed to step clock: %m");
 }
 
@@ -122,7 +139,7 @@ void sysclk_set_leap(int leap)
 	default:
 		tx.status = 0;
 	}
-	if (clock_adjtime(clkid, &tx) < 0)
+	if (clock_adjtime_wrapper(clkid, &tx) < 0)
 		pr_err("failed to set the clock status: %m");
 	else if (m)
 		pr_notice("%s", m);
@@ -136,7 +153,7 @@ void sysclk_set_tai_offset(int offset)
 	memset(&tx, 0, sizeof(tx));
 	tx.modes = ADJ_TAI;
 	tx.constant = offset;
-	if (clock_adjtime(clkid, &tx) < 0)
+	if (clock_adjtime_wrapper(clkid, &tx) < 0)
 		pr_err("failed to set TAI offset: %m");
 }
 
@@ -146,7 +163,7 @@ int sysclk_max_freq(void)
 	int f = 0;
 	struct timex tx;
 	memset(&tx, 0, sizeof(tx));
-	if (clock_adjtime(clkid, &tx) < 0)
+	if (clock_adjtime_wrapper(clkid, &tx) < 0)
 		pr_err("failed to read out the clock maximum adjustment: %m");
 	else
 		f = tx.tolerance / 65.536;
@@ -172,6 +189,6 @@ void sysclk_set_sync(void)
 	   to avoid getting the STA_UNSYNC flag back. */
 	tx.modes = ADJ_STATUS | ADJ_MAXERROR;
 	tx.status = realtime_leap_bit;
-	if (clock_adjtime(clkid, &tx) < 0)
+	if (clock_adjtime_wrapper(clkid, &tx) < 0)
 		pr_err("failed to set clock status and maximum error: %m");
 }

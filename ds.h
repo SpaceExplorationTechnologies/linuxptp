@@ -98,7 +98,7 @@ struct parent_ds {
 	unsigned int path_length;
 };
 
-#define CURRENT_UTC_OFFSET  35 /* 1 Jul 2012 */
+#define CURRENT_UTC_OFFSET  37 /* 1 Jan 2017 */
 #define INTERNAL_OSCILLATOR 0xA0
 
 struct timePropertiesDS {
@@ -132,6 +132,7 @@ struct port_defaults {
 	UInteger8 syncReceiptTimeout;
 	UInteger8 transportSpecific;
 	int announce_span;
+	UInteger32 sync_interval_addend_ns;
 	int path_trace_enabled;
 	int follow_up_info;
 	int freq_est_interval; /*log seconds*/

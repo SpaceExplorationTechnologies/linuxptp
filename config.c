@@ -17,7 +17,9 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 #include <ctype.h>
+#include <errno.h>
 #include <float.h>
+#include <glob.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +115,12 @@ static enum parser_result parse_pod_setting(const char *option,
 		if (r != PARSED_OK)
 			return r;
 		pod->path_trace_enabled = val;
+
+	} else if (!strcmp(option, "sync_interval_addend_ns")) {
+		r = get_ranged_uint(value, &uval, 0, 250000000);
+		if (r != PARSED_OK)
+			return r;
+		pod->sync_interval_addend_ns = uval;
 
 	} else if (!strcmp(option, "follow_up_info")) {
 		r = get_ranged_int(value, &val, 0, 1);
@@ -222,6 +230,18 @@ static enum parser_result parse_port_setting(const char *option,
 		if (r != PARSED_OK)
 			return r;
 		iface->boundary_clock_jbod = val;
+
+	} else if (!strcmp(option, "master_has_multi_port")) {
+		r = get_ranged_int(value, &val, 0, 1);
+		if (r != PARSED_OK)
+			return r;
+		iface->master_has_multi_port = val;
+
+	} else if (!strcmp(option, "sync_on_carrier_down")) {
+		r = get_ranged_int(value, &val, 0, 1);
+		if (r != PARSED_OK)
+			return r;
+		iface->sync_on_carrier_down = val;
 
 	} else
 		return NOT_PARSED;
@@ -401,6 +421,12 @@ static enum parser_result parse_global_setting(const char *option,
 			return r;
 		*cfg->pi_integral_norm_max = df;
 
+	} else if (!strcmp(option, "pi_init_freq_est_interval")) {
+		r = get_ranged_double(value, &df, 0.0, 1000.0);
+		if (r != PARSED_OK)
+			return r;
+		*cfg->pi_init_freq_est_interval = df;
+
 	} else if (!strcmp(option, "step_threshold")) {
 		r = get_ranged_double(value, &df, 0.0, DBL_MAX);
 		if (r != PARSED_OK)
@@ -418,6 +444,36 @@ static enum parser_result parse_global_setting(const char *option,
 		if (r != PARSED_OK)
 			return r;
 		*cfg->max_frequency = val;
+
+	} else if (!strcmp(option, "offset_filter") ||
+	           !strcmp(option, "pi_offset_filter")) {
+		if (!strcasecmp("moving_average", value))
+			*cfg->offset_filter = FILTER_MOVING_AVERAGE;
+		else if (!strcasecmp("moving_median", value))
+			*cfg->offset_filter = FILTER_MOVING_MEDIAN;
+		else if (!strcasecmp("moving_minimum", value))
+			*cfg->offset_filter = FILTER_MOVING_MINIMUM;
+		else
+			return BAD_VALUE;
+
+	} else if (!strcmp(option, "offset_filter_length") ||
+		   !strcmp(option, "pi_offset_filter_length")) {
+		r = get_ranged_int(value, &val, 1, 1000);
+		if (r != PARSED_OK)
+			return r;
+		*cfg->offset_filter_length = val;
+
+	} else if (!strcmp(option, "min_filter_start")) {
+		r = get_ranged_int(value, &val, 1, 1000);
+		if (r != PARSED_OK)
+			return r;
+		*cfg->min_filter_start = val;
+
+	} else if (!strcmp(option, "min_filter_stop")) {
+		r = get_ranged_int(value, &val, 1, 1000);
+		if (r != PARSED_OK)
+			return r;
+		*cfg->min_filter_stop = val;
 
 	} else if (!strcmp(option, "sanity_freq_limit")) {
 		r = get_ranged_int(value, &val, 0, INT_MAX);
@@ -487,6 +543,8 @@ static enum parser_result parse_global_setting(const char *option,
 				cfg->timestamping = TS_SOFTWARE;
 			else if (0 == strcasecmp("legacy", value))
 				cfg->timestamping = TS_LEGACY_HW;
+			else if (0 == strcasecmp("legacy_sw", value))
+				cfg->timestamping = TS_LEGACY_SW;
 			else
 				return BAD_VALUE;
 		}
@@ -571,6 +629,8 @@ static enum parser_result parse_global_setting(const char *option,
 			cfg->dds.delay_filter = FILTER_MOVING_AVERAGE;
 		else if (!strcasecmp("moving_median", value))
 			cfg->dds.delay_filter = FILTER_MOVING_MEDIAN;
+		else if (!strcasecmp("moving_minimum", value))
+			cfg->dds.delay_filter = FILTER_MOVING_MINIMUM;
 		else
 			return BAD_VALUE;
 
@@ -743,6 +803,81 @@ parse_error:
 	return -2;
 }
 
+/**
+ * Function to find the physical interface for an interface.
+ *
+ * @param name        Original name of interface. strlen must be no longer than
+ *                    MAX_IFNAME_SIZE.
+ * @param phys_name   Output parameter that is filled with the name of
+ *                    the underlying physical interface. This should be a
+ *                    buffer of at least MAX_IFNAME_SIZE+1 (for NUL
+ *                    terminator).
+ * @return            Zero on success, non-zero otherwise.
+ *
+ * This information *is* available rtnetlink... but that appears to be
+ * overkill for us.
+ *
+ * NOTE: This does nothing on Linux v3.2 (the lower_ symlink does not exist),
+ * but works on Linux v3.13+.
+ */
+static int config_fill_phys_name(const char *name, char *phys_name)
+{
+	int i;
+
+	strncpy(phys_name, name, MAX_IFNAME_SIZE);
+	phys_name[MAX_IFNAME_SIZE] = '\0';
+
+	/* Limit the number of iterations out of paranoia.
+	 * We do not believe there will be infinite loops in practice.
+	 */
+	for (i = 0; i < 100; i++) {
+		glob_t lower_iface_glob;
+		char pattern[strlen("/sys/class/net//lower_*") +
+			     MAX_IFNAME_SIZE + 1];
+		int ret;
+
+		memset(&lower_iface_glob, 0, sizeof(lower_iface_glob));
+		memset(pattern, 0, sizeof(pattern));
+
+		ret = snprintf(pattern, sizeof(pattern),
+			       "/sys/class/net/%s/lower_*", phys_name);
+		if (ret < 0 || (size_t) ret >= sizeof(pattern)) {
+			fprintf(stderr,
+				"unexpected error in pattern snprintf()!\n");
+			/* Propagate negative error value. */
+			if (ret > 0)
+				ret = EINVAL;
+			return ret;
+		}
+
+		ret = glob(pattern, GLOB_NOSORT, NULL, &lower_iface_glob);
+		if (ret == GLOB_NOMATCH) {
+			/* Normal terminating condition. */
+			ret = 0;
+			globfree(&lower_iface_glob);
+			return ret;
+		} else if (ret != 0) {
+			fprintf(stderr, "glob() failed with error %d\n", ret);
+			globfree(&lower_iface_glob);
+			return ret;
+		} else if (lower_iface_glob.gl_pathc != 1) {
+			fprintf(stderr, "glob() returned multiple 'lower' "
+				"(underlying) interfaces for '%s'/'%s'\n",
+				name, phys_name);
+			globfree(&lower_iface_glob);
+			return EINVAL;
+		}
+		strncpy(phys_name,
+			/* copy first/only match; - 1 to strip off the '*' */
+			&lower_iface_glob.gl_pathv[0][strlen(pattern) - 1],
+			MAX_IFNAME_SIZE);
+		globfree(&lower_iface_glob);
+	}
+	fprintf(stderr, "Infinite recursion detected with '%s'/'%s'!\n",
+		name, phys_name);
+	return EINVAL;
+}
+
 struct interface *config_create_interface(char *name, struct config *cfg)
 {
 	struct interface *iface;
@@ -760,6 +895,10 @@ struct interface *config_create_interface(char *name, struct config *cfg)
 	}
 
 	strncpy(iface->name, name, MAX_IFNAME_SIZE);
+	if (config_fill_phys_name(iface->name, iface->phys_name) != 0) {
+		free(iface);
+		return NULL;
+	}
 	STAILQ_INSERT_TAIL(&cfg->interfaces, iface, list);
 	return iface;
 }
@@ -770,7 +909,7 @@ void config_init_interface(struct interface *iface, struct config *cfg)
 	iface->transport = cfg->transport;
 	memcpy(&iface->pod, &cfg->pod, sizeof(cfg->pod));
 
-	sk_get_ts_info(iface->name, &iface->ts_info);
+	sk_get_ts_info(iface->phys_name, &iface->ts_info);
 
 	iface->delay_filter = cfg->dds.delay_filter;
 	iface->delay_filter_length = cfg->dds.delay_filter_length;

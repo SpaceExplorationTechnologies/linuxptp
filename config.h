@@ -35,6 +35,7 @@
 struct interface {
 	STAILQ_ENTRY(interface) list;
 	char name[MAX_IFNAME_SIZE + 1];
+	char phys_name[MAX_IFNAME_SIZE + 1];
 	enum delay_mechanism dm;
 	enum transport_type transport;
 	struct port_defaults pod;
@@ -42,6 +43,8 @@ struct interface {
 	enum filter_type delay_filter;
 	int delay_filter_length;
 	int boundary_clock_jbod;
+	int master_has_multi_port;
+	int sync_on_carrier_down;
 };
 
 #define CFG_IGNORE_DM           (1 << 0)
@@ -74,6 +77,10 @@ struct config {
 	double *step_threshold;
 	double *first_step_threshold;
 	int *max_frequency;
+	enum filter_type *offset_filter;
+	int *offset_filter_length;
+	int *min_filter_start;
+	int *min_filter_stop;
 
 	double *pi_proportional_const;
 	double *pi_integral_const;
@@ -83,6 +90,7 @@ struct config {
 	double *pi_integral_scale;
 	double *pi_integral_exponent;
 	double *pi_integral_norm_max;
+	double *pi_init_freq_est_interval;
 	int *ntpshm_segment;
 
 	unsigned char *ptp_dst_mac;

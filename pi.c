@@ -43,6 +43,7 @@ double configured_pi_kp_norm_max = 0.7;
 double configured_pi_ki_scale = 0.0;
 double configured_pi_ki_exponent = 0.4;
 double configured_pi_ki_norm_max = 0.3;
+double configured_pi_init_freq_est_interval = -1.0;
 
 struct pi_servo {
 	struct servo servo;
@@ -91,7 +92,13 @@ static double pi_sample(struct servo *servo,
 		/* Wait long enough before estimating the frequency offset. */
 		localdiff = (s->local[1] - s->local[0]) / 1e9;
 		localdiff += localdiff * FREQ_EST_MARGIN;
-		freq_est_interval = 0.016 / s->ki;
+		if (configured_pi_init_freq_est_interval >= 0.0) {
+			freq_est_interval =
+				configured_pi_init_freq_est_interval;
+		}
+		else {
+			freq_est_interval = 0.016 / s->ki;
+		}
 		if (freq_est_interval > 1000.0) {
 			freq_est_interval = 1000.0;
 		}

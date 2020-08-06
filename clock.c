@@ -22,7 +22,6 @@
 #include <string.h>
 #include <time.h>
 #include <sys/queue.h>
-
 #include "address.h"
 #include "bmc.h"
 #include "clock.h"
@@ -30,19 +29,28 @@
 #include "clockcheck.h"
 #include "foreign.h"
 #include "filter.h"
+#include "gpstime.h"
 #include "missing.h"
 #include "msg.h"
 #include "phc.h"
 #include "port.h"
 #include "servo.h"
 #include "stats.h"
+#include "stats_file.h"
 #include "print.h"
 #include "tlv.h"
+#include "tmv.h"
 #include "uds.h"
 #include "util.h"
 
 #define N_CLOCK_PFD (N_POLLFD + 1) /* one extra per port, for the fault timer */
 #define POW2_41 ((double)(1ULL << 41))
+
+/* This takes its value from the configuration file. (see ptp4l.c) */
+enum filter_type configured_offset_filter = FILTER_MOVING_MEDIAN;
+
+/* This takes its value from the configuration file. (see ptp4l.c) */
+int configured_offset_filter_length = 1;
 
 struct port {
 	LIST_ENTRY(port) list;
@@ -87,7 +95,7 @@ struct clock {
 	struct port *uds_port;
 	struct pollfd *pollfd;
 	int pollfd_valid;
-	int nports; /* does not include the UDS port */
+	int nports; /* does not include the UDS port, unless UDS port has clock associated */
 	int last_port_number;
 	int free_running;
 	int freq_est_interval;
@@ -100,9 +108,13 @@ struct clock {
 	int time_flags;  /* grand master role */
 	int time_source; /* grand master role */
 	enum servo_state servo_state;
-	tmv_t master_offset;
+	tmv_t master_offset_raw;  /* telemetered as master_offset */
+	tmv_t master_offset;	  /* telemetered as master_offset_filtered */
 	tmv_t path_delay;
+	tmv_t path_delay_raw;
+	int path_delay_set; /* 0 until 'path_delay' is set */
 	struct filter *delay_filter;
+	struct filter *offset_filter;
 	struct freq_estimator fest;
 	struct time_status_np status;
 	double nrr;
@@ -113,12 +125,61 @@ struct clock {
 	struct clock_description desc;
 	struct clock_stats stats;
 	int stats_interval;
+	/*
+	 * The file to output stats to.
+	 */
+	const char *stats_filename;
+	/*
+	 * Last time we printed output for telemetry.
+	 */
+	int64_t last_stats_file_update;
+	/*
+	 * The leap second table filename.
+	 */
+	const char *leap_table_filename;
+	/*
+	 * Last time we re-read the leap second table.
+	 */
+	int64_t last_leap_table_update;
+	/*
+	 * Leap table provided by libgpstime.
+	 */
+	struct gpstime_leap_table_t *leap_table;
 	struct clockcheck *sanity_check;
 	struct interface uds_interface;
 	LIST_HEAD(clock_subscribers_head, clock_subscriber) subscribers;
+	const char* uds_clock_filename;
 };
 
 struct clock the_clock;
+
+/*
+ * Lookup table for the clockAccuracy attribute.
+ * See IEEE Std 1588-2008, Table 6 -- clockAccuracy enumeration
+ * These values are in nanoseconds (for consistency with other output).
+ */
+static const int64_t CLOCK_ACCURACIES[0x100] = {
+	[0 ... 0x1F]	= -1,
+	[0x20]		= 25,
+	[0x21]		= 100,
+	[0x22]		= 250,
+	[0x23]		= 1000,
+	[0x24]		= 2500,
+	[0x25]		= 10000,
+	[0x26]		= 25000,
+	[0x27]		= 100000,
+	[0x28]		= 250000,
+	[0x29]		= 1000000,
+	[0x2A]		= 2500000,
+	[0x2B]		= 10000000,
+	[0x2C]		= 25000000,
+	[0x2D]		= 100000000,
+	[0x2E]		= 250000000,
+	[0x2F]		= NS_PER_SEC,
+	[0x30]		= 10 * NS_PER_SEC,
+	[0x31]		= INT64_MAX,
+	[0x32 ... 0xFF]	= -1
+};
 
 static void handle_state_decision_event(struct clock *c);
 static int clock_resize_pollfd(struct clock *c, int new_nports);
@@ -274,9 +335,11 @@ void clock_destroy(struct clock *c)
 	}
 	servo_destroy(c->servo);
 	filter_destroy(c->delay_filter);
+	filter_destroy(c->offset_filter);
 	stats_destroy(c->stats.offset);
 	stats_destroy(c->stats.freq);
 	stats_destroy(c->stats.delay);
+
 	if (c->sanity_check)
 		clockcheck_destroy(c->sanity_check);
 	memset(c, 0, sizeof(*c));
@@ -545,6 +608,265 @@ static void clock_stats_update(struct clock_stats *s,
 	stats_reset(s->delay);
 }
 
+static void clock_print_to_stats_file(struct clock *c)
+{
+	int64_t best_id;
+	int64_t master_id;
+	int64_t my_id;
+	struct timespec now;
+	int64_t now_nanoseconds;
+	struct port *p;
+	char port_state_output[1024] = { '\0' };
+	size_t port_state_bytes_left = sizeof(port_state_output);
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_nanoseconds = tmv_to_nanoseconds(timespec_to_tmv(now));
+
+	/*
+	 * Update at 2Hz max.
+	 */
+	if ((now_nanoseconds - c->last_stats_file_update) < (NS_PER_SEC / 2))
+		return;
+
+	c->last_stats_file_update = now_nanoseconds;
+
+	/* Clock identifiers are stored in network byte order. */
+	memcpy(&best_id, c->best_id.id, sizeof(best_id));
+	best_id = net2host64(best_id);
+	memcpy(&master_id, c->dad.pds.parentPortIdentity.clockIdentity.id,
+	       sizeof(master_id));
+	master_id = net2host64(master_id);
+	memcpy(&my_id, c->dds.clockIdentity.id, sizeof(my_id));
+	my_id = net2host64(my_id);
+
+	LIST_FOREACH(p, &c->ports, list) {
+		int bytes_consumed = snprintf(
+			&port_state_output[sizeof(port_state_output) -
+					   port_state_bytes_left],
+			port_state_bytes_left,
+			"port%d_state: %d\n",
+			port_number(p), port_state(p));
+		if (bytes_consumed < 0)
+			break;
+		else if (bytes_consumed > port_state_bytes_left)
+			bytes_consumed = port_state_bytes_left;
+		port_state_bytes_left -= bytes_consumed;
+	}
+	port_state_output[sizeof(port_state_output) - 1] = '\0';
+
+	if (stats_file_print(c->stats_filename,
+			     "monotonic_timestamp: %" PRId64 "\n"
+			     "master_offset: %" PRId64 "\n"
+			     "servo_state: %d\n"
+			     "freq: %f\n"
+			     "path_delay: %" PRId64 "\n"
+			     "best_id: 0x%016" PRIx64 "\n"
+			     "steps_removed: %" PRId16 "\n"
+			     "master_id: 0x%016" PRIx64 "\n"
+			     "master_port_number: %" PRId16 "\n"
+			     "my_id: 0x%016" PRIx64 "\n"
+			     "nrr: %f\n"
+			     "c1: %" PRId64 "\n"
+			     "c2: %" PRId64 "\n"
+			     "t1: %" PRId64 "\n"
+			     "t2: %" PRId64 "\n"
+			     "free_running: %d\n"
+			     "freq_est_interval: %d\n"
+			     "grand_master_capable: %d\n"
+			     "utc_timescale: %d\n"
+			     "utc_offset_set: %d\n"
+			     "leap_set: %d\n"
+			     "kernel_leap: %d\n"
+			     "utc_offset: %d\n"
+			     "time_flags: 0x%08x\n"
+			     "time_source: 0x%02x\n"
+			     "gm_clock_class: %u\n"
+			     "gm_clock_accuracy: %" PRId64 "\n"
+			     "my_clock_class: %u\n"
+			     "my_clock_accuracy: %" PRId64 "\n"
+			     "gm_priority1: %u\n"
+			     "gm_priority2: %u\n"
+			     "my_priority1: %u\n"
+			     "my_priority2: %u\n"
+			     "%s"
+			     "master_offset_filtered: %" PRId64 "\n"
+			     "path_delay_raw: %" PRId64 "\n",
+			     now_nanoseconds,
+			     tmv_to_nanoseconds(c->master_offset_raw),
+			     c->servo_state,
+			     clockadj_get_freq(c->clkid),
+			     tmv_to_nanoseconds(c->path_delay),
+			     best_id,
+			     c->cur.stepsRemoved,
+			     master_id,
+			     c->dad.pds.parentPortIdentity.portNumber,
+			     my_id,
+			     c->nrr,
+			     tmv_to_nanoseconds(c->c1),
+			     tmv_to_nanoseconds(c->c2),
+			     tmv_to_nanoseconds(c->t1),
+			     tmv_to_nanoseconds(c->t2),
+			     c->free_running,
+			     c->freq_est_interval,
+			     c->grand_master_capable,
+			     c->utc_timescale,
+			     c->utc_offset_set,
+			     c->leap_set,
+			     c->kernel_leap,
+			     clock_current_utc_offset(c),
+			     c->time_flags,
+			     c->time_source,
+			     c->dad.pds.grandmasterClockQuality.clockClass,
+			     CLOCK_ACCURACIES[c->dad.pds.grandmasterClockQuality.
+				clockAccuracy],
+			     c->dds.clockQuality.clockClass,
+			     CLOCK_ACCURACIES[c->dds.clockQuality.clockAccuracy],
+			     c->dad.pds.grandmasterPriority1,
+			     c->dad.pds.grandmasterPriority2,
+			     c->dds.priority1,
+			     c->dds.priority2,
+			     port_state_output,
+			     tmv_to_nanoseconds(c->master_offset),
+			     tmv_to_nanoseconds(c->path_delay_raw)))
+	{
+		/*
+		 * Clear 'stats_filename' on error so that we do not spam.
+		 */
+		c->stats_filename = NULL;
+	}
+}
+
+/*
+ * Update the clock's grandmaster settings based on libgpstime. This sets the
+ * UTC offset and leap second flags based on a leap second table.
+ *
+ * @return 1 if the grandmaster settings were changed. This means a state
+ *         determination event (sde) is required to copy the grandmaster
+ *         settings into the appropriate datasets.
+ */
+static int clock_update_libgpstime_leap_second(struct clock *c)
+{
+	struct timespec now;
+	int64_t now_ns;
+	int64_t time_since_update;
+	gpstime_error_code_t gpstime_error;
+	gpstime_nano_t current_gps_time;
+	int current_gps_leaps;
+	int future_gps_leaps;
+	int new_utc_offset;
+	int new_time_flags;
+
+	/*
+	 * Skip update if we're not configured to use a leap second table.
+	 */
+	if (!c->leap_table_filename)
+	{
+		return 0;
+	}
+
+	/*
+	 * Re-read the table if we don't have one, or if it is over an hour
+	 * old. This allows us to update the leap second table without having to
+	 * restart ptp4l.
+	 */
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_ns = tmv_to_nanoseconds(timespec_to_tmv(now));
+	time_since_update = now_ns - c->last_leap_table_update;
+	if (!c->leap_table || time_since_update > NS_PER_HOUR)
+	{
+		struct gpstime_leap_table_t *new_leap_table;
+
+		c->last_leap_table_update = now_ns;
+		new_leap_table = gpstime_leap_table_parse_any(
+			c->leap_table_filename,
+			&gpstime_error);
+		if (new_leap_table)
+		{
+			pr_debug("libgpstime: read leap table");
+			gpstime_leap_table_free(c->leap_table);
+			c->leap_table = new_leap_table;
+		}
+		else
+		{
+			pr_err("libgpstime: failed to read leap table '%s' error %d",
+			       c->leap_table_filename,
+			       (int)gpstime_error);
+		}
+	}
+
+	/*
+	 * Don't proceed without a leap table.
+	 */
+	if (!c->leap_table)
+	{
+		return 0;
+	}
+
+	/*
+	 * Get the UTC offset.
+	 */
+	current_gps_time = gpstime_get_gps_time(c->leap_table);
+	current_gps_leaps = gpstime_get_leaps_since_gps_epoch(c->leap_table,
+							      current_gps_time);
+	new_utc_offset = gpstime_leaps_between_ptp_and_gps + current_gps_leaps;
+
+	/*
+	 * Get the time flags. Always assert UTC_OFF_VALID, which indicates that
+	 * we know the current UTC offset. Always assert TIME_TRACEABLE and
+	 * FREQ_TRACEABLE, which indicates that our time is traceable to an
+	 * official source of time. We always use the leap second table in
+	 * conjunction with NTP, but ideally this would be configurable.
+	 */
+	new_time_flags = c->time_flags;
+	new_time_flags |= UTC_OFF_VALID | TIME_TRACEABLE | FREQ_TRACEABLE;
+
+	/*
+	 * To determine if a leap second will occur, look half a day into the
+	 * future and see if there is a different UTC offset.
+	 *
+	 * IEEE1588-2008 section 9.4 states that these should be true no earlier
+	 * than 12 hours before midnight, and that they should be cleared within
+	 * +/- 2 announcement messages of midnight.
+	 */
+	future_gps_leaps = gpstime_get_leaps_since_gps_epoch(
+		c->leap_table,
+		current_gps_time + (NS_PER_DAY / 2));
+	new_time_flags &= ~(LEAP_59 | LEAP_61);
+	if (future_gps_leaps > current_gps_leaps)
+	{
+		new_time_flags |= LEAP_61;
+	}
+	else if (future_gps_leaps < current_gps_leaps)
+	{
+		new_time_flags |= LEAP_59;
+	}
+
+	/*
+	 * If nothing has changed, then stop here.
+	 */
+	if (c->utc_offset == new_utc_offset && c->time_flags == new_time_flags)
+	{
+	    return 0;
+	}
+
+	/*
+	 * Otherwise, update the grandmaster settings, and return 1 to trigger a
+	 * state determination event. This will call
+	 * handle_state_decision_for_port() for each port, which will invoke
+	 * clock_update_grandmaster() on all ports every time we are currently
+	 * the grandmaster. This function is responsible for copying these
+	 * parameters into the timedataset.
+	 */
+	c->utc_offset = new_utc_offset;
+	c->time_flags = new_time_flags;
+
+	pr_notice("libgpstime: updated grandmaster settings: utc_offset %d time_flags 0x%x",
+		  c->utc_offset,
+		  c->time_flags);
+
+	return 1;
+}
+
 static enum servo_state clock_no_adjust(struct clock *c)
 {
 	double fui;
@@ -655,6 +977,21 @@ static void clock_update_slave(struct clock *c)
 	}
 }
 
+int clock_current_utc_offset(struct clock *c)
+{
+	int utc_offset;
+
+	if (c->tds.flags & UTC_OFF_VALID && c->tds.flags & TIME_TRACEABLE) {
+		utc_offset = c->tds.currentUtcOffset;
+	} else if (c->tds.currentUtcOffset > CURRENT_UTC_OFFSET) {
+		utc_offset = c->tds.currentUtcOffset;
+	} else {
+		utc_offset = CURRENT_UTC_OFFSET;
+	}
+
+	return utc_offset;
+}
+
 static int clock_utc_correct(struct clock *c, tmv_t ingress)
 {
 	struct timespec offset;
@@ -664,13 +1001,7 @@ static int clock_utc_correct(struct clock *c, tmv_t ingress)
 	if (!c->utc_timescale)
 		return 0;
 
-	if (c->tds.flags & UTC_OFF_VALID && c->tds.flags & TIME_TRACEABLE) {
-		utc_offset = c->tds.currentUtcOffset;
-	} else if (c->tds.currentUtcOffset > CURRENT_UTC_OFFSET) {
-		utc_offset = c->tds.currentUtcOffset;
-	} else {
-		utc_offset = CURRENT_UTC_OFFSET;
-	}
+	utc_offset = clock_current_utc_offset(c);
 
 	if (c->tds.flags & LEAP_61) {
 		leap = 1;
@@ -761,12 +1092,22 @@ static int clock_add_port(struct clock *c, int phc_index,
 
 	if (clock_resize_pollfd(c, c->nports + 1))
 		return -1;
-	p = port_open(phc_index, timestamping, ++c->last_port_number,
+
+	/* This differs from the implementation in master,
+	 * last_port_number is now post-fix incremented to correctly
+	 * allow the registration of port 0.
+	 */
+	p = port_open(phc_index, timestamping, c->last_port_number++,
 		      iface, c);
 	if (!p) {
 		/* No need to shrink pollfd */
 		return -1;
 	}
+
+	/* If this is the UDS port, initialize the clock structure here instead. */
+	if (iface->ts_info.phc_index == PHC_INDEX_UDS)
+		c->uds_port = p;
+
 	LIST_FOREACH(piter, &c->ports, list)
 		lastp = piter;
 	if (lastp)
@@ -793,9 +1134,10 @@ static void clock_remove_port(struct clock *c, struct port *p)
 
 struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 			   enum timestamp_type timestamping, struct default_ds *dds,
-			   enum servo_type servo)
+			   enum servo_type servo, const char *stats_filename,
+			   const char *leap_table_filename, const char *uds_clock_filename)
 {
-	int fadj = 0, max_adj = 0, sw_ts = timestamping == TS_SOFTWARE ? 1 : 0;
+	int fadj = 0, max_adj = 0, sw_ts = timestamping_is_software(timestamping) ? 1 : 0;
 	struct clock *c = &the_clock;
 	struct port *p;
 	char phc[32];
@@ -817,6 +1159,16 @@ struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 	c->freq_est_interval = dds->freq_est_interval;
 	c->grand_master_capable = dds->grand_master_capable;
 	c->kernel_leap = dds->kernel_leap;
+
+	/*
+	 * Save the UDS clock device name, if any.
+	 */
+	c->uds_clock_filename = uds_clock_filename;
+
+	/*
+	 * If we have libgpstime, we will overwrite utc_offset in
+	 * clock_update_libgpstime_leap_second.
+	 */
 	c->utc_offset = CURRENT_UTC_OFFSET;
 	c->time_source = dds->time_source;
 	c->desc = dds->clock_desc;
@@ -848,7 +1200,8 @@ struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 	}
 	c->utc_offset_set = 0;
 	c->leap_set = 0;
-	c->time_flags = c->utc_timescale ? 0 : PTP_TIMESCALE;
+	/* Always use PTP timescale */
+	c->time_flags = PTP_TIMESCALE;
 
 	if (c->clkid != CLOCK_INVALID) {
 		fadj = (int) clockadj_get_freq(c->clkid);
@@ -870,6 +1223,12 @@ struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 		pr_err("Failed to create delay filter");
 		return NULL;
 	}
+	c->offset_filter = filter_create(configured_offset_filter,
+					 configured_offset_filter_length);
+	if (!c->offset_filter) {
+		pr_err("Failed to create offset filter");
+		return NULL;
+	}
 	c->nrr = 1.0;
 	c->stats_interval = dds->stats_interval;
 	c->stats.offset = stats_create();
@@ -879,6 +1238,26 @@ struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 		pr_err("failed to create stats");
 		return NULL;
 	}
+	c->stats_filename = stats_filename;
+
+	c->leap_table_filename = leap_table_filename;
+	c->last_leap_table_update = 0;
+	c->leap_table = NULL;
+	if (c->leap_table_filename)
+	{
+		/*
+		 * If we're configured to use a leap table, perform a leap
+		 * second update now to attempt to read in the table. If we
+		 * don't have a table, error out so we can discover leap table
+		 * problems at initialization.
+		 */
+		clock_update_libgpstime_leap_second(c);
+		if (!c->leap_table) {
+			pr_err("Failed to initialize leap second table");
+			return NULL;
+		}
+	}
+
 	if (dds->sanity_freq_limit) {
 		c->sanity_check = clockcheck_create(dds->sanity_freq_limit);
 		if (!c->sanity_check) {
@@ -905,16 +1284,38 @@ struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 	/*
 	 * Create the UDS interface.
 	 */
-	if (clock_resize_pollfd(c, 0)) {
-		pr_err("failed to allocate pollfd");
-		return NULL;
+	if (c->uds_clock_filename) {
+		int rc;
+
+		/* Create a "valid" ts_info structure, with an special phc_index. */
+		udsif->ts_info.valid = 1;
+		udsif->ts_info.phc_index = PHC_INDEX_UDS;
+		udsif->boundary_clock_jbod = dds->boundary_clock_jbod;
+
+		/* And register it normally as a clock port. */
+		rc = clock_add_port(c, phc_index, timestamping, udsif);
+		if (rc != 0) {
+			pr_err("failed to add UDS port with explicit PHC: %d",
+			       rc);
+			return NULL;
+		}
+	} else {
+		if (clock_resize_pollfd(c, 0)) {
+			pr_err("failed to allocate pollfd");
+			return NULL;
+		}
+		c->uds_port = port_open(phc_index, timestamping, 0, udsif, c);
+		if (!c->uds_port) {
+			pr_err("failed to open the UDS port");
+			return NULL;
+		}
+		clock_fda_changed(c);
+
+		/* Increment the port number, since clock_add_port now uses post-fix
+		 * incrementing.
+		 */
+		c->last_port_number++;
 	}
-	c->uds_port = port_open(phc_index, timestamping, 0, udsif, c);
-	if (!c->uds_port) {
-		pr_err("failed to open the UDS port");
-		return NULL;
-	}
-	clock_fda_changed(c);
 
 	/* Create the ports. */
 	STAILQ_FOREACH(iface, ifaces, list) {
@@ -929,7 +1330,10 @@ struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 	LIST_FOREACH(p, &c->ports, list) {
 		port_dispatch(p, EV_INITIALIZE, 0);
 	}
-	port_dispatch(c->uds_port, EV_INITIALIZE, 0);
+
+	/* If there's no UDS clock, explicitly dispatch UDS. */
+	if (!c->uds_clock_filename)
+		port_dispatch(c->uds_port, EV_INITIALIZE, 0);
 
 	return c;
 }
@@ -990,10 +1394,15 @@ static int clock_resize_pollfd(struct clock *c, int new_nports)
 {
 	struct pollfd *new_pollfd;
 
-	/* Need to allocate one extra block of fds for uds */
-	new_pollfd = realloc(c->pollfd,
-			     (new_nports + 1) * N_CLOCK_PFD *
-			     sizeof(struct pollfd));
+	/* Need to allocate one extra block of fds for uds if there is not a
+	 * clock associated with the port */
+	if (c->uds_clock_filename)
+		new_pollfd = realloc(c->pollfd, new_nports * N_CLOCK_PFD *
+						    sizeof(struct pollfd));
+	else
+		new_pollfd = realloc(c->pollfd, (new_nports + 1) * N_CLOCK_PFD *
+						    sizeof(struct pollfd));
+
 	if (!new_pollfd)
 		return -1;
 	c->pollfd = new_pollfd;
@@ -1025,7 +1434,11 @@ static void clock_check_pollfd(struct clock *c)
 		clock_fill_pollfd(dest, p);
 		dest += N_CLOCK_PFD;
 	}
-	clock_fill_pollfd(dest, c->uds_port);
+
+	/* If there's no UDS clock, explicitly check UDS. */
+	if (!c->uds_clock_filename)
+		clock_fill_pollfd(dest, c->uds_port);
+
 	c->pollfd_valid = 1;
 }
 
@@ -1062,8 +1475,13 @@ static void clock_forward_mgmt_msg(struct clock *c, struct port *p, struct ptp_m
 				pr_err("port %d: management forward failed",
 				       port_number(piter));
 		}
-		if (clock_do_forward_mgmt(c, p, c->uds_port, msg, &msg_ready))
-			pr_err("uds port: management forward failed");
+
+		/* If there's no UDS clock, explicitly handle UDS. */
+		if (!c->uds_clock_filename) {
+			if (clock_do_forward_mgmt(c, p, c->uds_port, msg, &msg_ready))
+				pr_err("uds port: management forward failed");
+		}
+
 		if (msg_ready) {
 			msg_post_recv(msg, pdulen);
 			msg->management.boundaryHops++;
@@ -1233,7 +1651,13 @@ int clock_poll(struct clock *c)
 	struct port *p;
 
 	clock_check_pollfd(c);
-	cnt = poll(c->pollfd, (c->nports + 1) * N_CLOCK_PFD, -1);
+
+	/* If we're using the UDS clock, don't wait on an extra port. */
+	if (c->uds_clock_filename)
+		cnt = poll(c->pollfd, (c->nports) * N_CLOCK_PFD, -1);
+	else
+		cnt = poll(c->pollfd, (c->nports + 1) * N_CLOCK_PFD, -1);
+
 	if (cnt < 0) {
 		if (EINTR == errno) {
 			return 0;
@@ -1268,22 +1692,40 @@ int clock_poll(struct clock *c)
 		if (cur[N_POLLFD].revents & (POLLIN|POLLPRI)) {
 			clock_fault_timeout(p, 0);
 			port_dispatch(p, EV_FAULT_CLEARED, 0);
+			/* Did that fail to clear the fault? Try again. */
+			if (PS_FAULTY == port_state(p))
+				clock_fault_timeout(p, 1);
 		}
 
 		cur += N_CLOCK_PFD;
 	}
 
-	/* Check the UDS port. */
-	for (i = 0; i < N_POLLFD; i++) {
-		if (cur[i].revents & (POLLIN|POLLPRI)) {
-			event = port_event(c->uds_port, i);
-			if (EV_STATE_DECISION_EVENT == event)
-				sde = 1;
+	/* If there's no UDS clock, explicitly handle UDS. */
+	if (!c->uds_clock_filename) {
+		/* Check the UDS port. */
+		for (i = 0; i < N_POLLFD; i++) {
+			if (cur[i].revents & (POLLIN|POLLPRI)) {
+				event = port_event(c->uds_port, i);
+				if (EV_STATE_DECISION_EVENT == event)
+					sde = 1;
+				/* If the UDS has a master, this can happen here
+				 * too.
+				 * In other words, if we do not receive a timely
+				 * ANNOUNCE message, we want to be able to choose
+				 * a new master clock. */
+				if (EV_ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES == event)
+					sde = 1;
+			}
 		}
 	}
 
+	if (clock_update_libgpstime_leap_second(c))
+		sde = 1;
+
 	if (sde)
 		handle_state_decision_event(c);
+
+	clock_print_to_stats_file(c);
 
 	clock_prune_subscriptions(c);
 	return 0;
@@ -1331,7 +1773,9 @@ void clock_path_delay(struct clock *c, struct timespec req, struct timestamp rx,
 		pr_debug("c3 %10" PRId64, c3);
 	}
 
+	c->path_delay_set = 1;
 	c->path_delay = filter_sample(c->delay_filter, pd);
+	c->path_delay_raw = pd;
 
 	c->cur.meanPathDelay = tmv_to_TimeInterval(c->path_delay);
 
@@ -1343,6 +1787,7 @@ void clock_path_delay(struct clock *c, struct timespec req, struct timestamp rx,
 
 void clock_peer_delay(struct clock *c, tmv_t ppd, double nrr)
 {
+	c->path_delay_set = 1;
 	c->path_delay = ppd;
 	c->nrr = nrr;
 
@@ -1367,7 +1812,21 @@ int clock_switch_phc(struct clock *c, int phc_index)
 	clockid_t clkid;
 	char phc[32];
 
-	snprintf(phc, 31, "/dev/ptp%d", phc_index);
+	if (phc_index == PHC_INDEX_UDS && c->uds_clock_filename) {
+		strncpy(phc, c->uds_clock_filename, sizeof(phc) - 1);
+		phc[sizeof(phc) - 1] = '\0';
+	} else {
+		int ret = snprintf(phc, sizeof(phc), "/dev/ptp%d", phc_index);
+		if (ret < 0) {
+			pr_err("failed to format the ptp device: %m");
+			return -1;
+
+		} else if (ret >= sizeof(phc)) {
+			pr_err("incompletely formatted ptp device");
+			return -1;
+		}
+	}
+
 	clkid = phc_open(phc);
 	if (clkid == CLOCK_INVALID) {
 		pr_err("Switching PHC, failed to open %s: %m", phc);
@@ -1404,6 +1863,7 @@ enum servo_state clock_synchronize(struct clock *c,
 	double adj;
 	tmv_t ingress, origin;
 	enum servo_state state = SERVO_UNLOCKED;
+	int clock_leap_second_ambiguous;
 
 	ingress = timespec_to_tmv(ingress_ts);
 	origin  = timestamp_to_tmv(origin_ts);
@@ -1417,13 +1877,26 @@ enum servo_state clock_synchronize(struct clock *c,
 	/*
 	 * c->master_offset = ingress - origin - c->path_delay - c->c1 - c->c2;
 	 */
-	c->master_offset = tmv_sub(ingress,
+	c->master_offset_raw = tmv_sub(ingress,
 		tmv_add(origin, tmv_add(c->path_delay, tmv_add(c->c1, c->c2))));
 
-	if (!c->path_delay)
+	/*
+	 * filter out network jitter
+	 */
+	c->master_offset = filter_sample(c->offset_filter,
+					 c->master_offset_raw);
+
+	clock_leap_second_ambiguous = clock_utc_correct(c, ingress);
+
+	if (!c->path_delay_set)
 		return state;
 
-	if (clock_utc_correct(c, ingress))
+	/*
+	 * "Coast" (keep current servo state, don't run servo) if we are
+	 * crossing a leap second, and therefore the clock's time is ambiguous
+	 * (only happens if 'c' is in UTC timescale).
+	 */
+	if (clock_leap_second_ambiguous)
 		return c->servo_state;
 
 	c->cur.offsetFromMaster = tmv_to_TimeInterval(c->master_offset);
@@ -1458,6 +1931,7 @@ enum servo_state clock_synchronize(struct clock *c,
 			clockcheck_step(c->sanity_check,
 					-tmv_to_nanoseconds(c->master_offset));
 		}
+		filter_reset(c->offset_filter);
 		break;
 	case SERVO_LOCKED:
 		clockadj_set_freq(c->clkid, -adj);
@@ -1505,6 +1979,38 @@ void clock_update_time_properties(struct clock *c, struct timePropertiesDS tds)
 	c->tds = tds;
 }
 
+static void handle_state_decision_for_port(struct clock *c, struct port *p,
+					   int fresh_best)
+{
+	enum fsm_event event;
+	enum port_state ps = bmc_state_decision(c, p);
+
+	switch (ps) {
+	case PS_LISTENING:
+		event = EV_NONE;
+		break;
+	case PS_GRAND_MASTER:
+		pr_notice("assuming the grand master role");
+		clock_update_grandmaster(c);
+		event = EV_RS_GRAND_MASTER;
+		break;
+	case PS_MASTER:
+		event = EV_RS_MASTER;
+		break;
+	case PS_PASSIVE:
+		event = EV_RS_PASSIVE;
+		break;
+	case PS_SLAVE:
+		clock_update_slave(c);
+		event = EV_RS_SLAVE;
+		break;
+	default:
+		event = EV_FAULT_DETECTED;
+		break;
+	}
+	port_dispatch(p, event, fresh_best);
+}
+
 static void handle_state_decision_event(struct clock *c)
 {
 	struct foreign_clock *best = NULL, *fc;
@@ -1520,6 +2026,16 @@ static void handle_state_decision_event(struct clock *c)
 			best = fc;
 	}
 
+	/* If there's no UDS clock registered, explicitly handle UDS. */
+	if (!c->uds_clock_filename) {
+		/* Try the UDS as well -- the best master clock might be there! */
+		fc = port_compute_best(c->uds_port);
+		if (fc) {
+			if (!best || dscmp(&fc->dataset, &best->dataset) > 0)
+				best = fc;
+		}
+	}
+
 	if (best) {
 		best_id = best->dataset.identity;
 	} else {
@@ -1532,10 +2048,23 @@ static void handle_state_decision_event(struct clock *c)
 	if (!cid_eq(&best_id, &c->best_id)) {
 		clock_freq_est_reset(c);
 		filter_reset(c->delay_filter);
+		filter_reset(c->offset_filter);
 		c->t1 = tmv_zero();
 		c->t2 = tmv_zero();
+		c->path_delay_set = 0;
 		c->path_delay = 0;
 		c->nrr = 1.0;
+		/* The n_messages check should never be true (see
+		 * port_compute_best()), but we keep it here for paranoia. */
+		if (!best || (best->n_messages < 1)) {
+			/* We are the grandmaster; clear the path trace. */
+			struct parent_ds *dad = clock_parent_ds(c);
+
+			dad->path_length = 0;
+		} else {
+			port_update_bmc_path_trace(
+				best->port, TAILQ_FIRST(&best->messages));
+		}
 		fresh_best = 1;
 	}
 
@@ -1543,34 +2072,10 @@ static void handle_state_decision_event(struct clock *c)
 	c->best_id = best_id;
 
 	LIST_FOREACH(piter, &c->ports, list) {
-		enum port_state ps;
-		enum fsm_event event;
-		ps = bmc_state_decision(c, piter);
-		switch (ps) {
-		case PS_LISTENING:
-			event = EV_NONE;
-			break;
-		case PS_GRAND_MASTER:
-			pr_notice("assuming the grand master role");
-			clock_update_grandmaster(c);
-			event = EV_RS_GRAND_MASTER;
-			break;
-		case PS_MASTER:
-			event = EV_RS_MASTER;
-			break;
-		case PS_PASSIVE:
-			event = EV_RS_PASSIVE;
-			break;
-		case PS_SLAVE:
-			clock_update_slave(c);
-			event = EV_RS_SLAVE;
-			break;
-		default:
-			event = EV_FAULT_DETECTED;
-			break;
-		}
-		port_dispatch(piter, event, fresh_best);
+		handle_state_decision_for_port(c, piter, fresh_best);
 	}
+	/* The UDS can now have a master; run its state machine as well. */
+	handle_state_decision_for_port(c, c->uds_port, fresh_best);
 }
 
 struct clock_description *clock_description(struct clock *c)
@@ -1588,6 +2093,7 @@ void clock_check_ts(struct clock *c, struct timespec ts)
 	if (c->sanity_check &&
 	    clockcheck_sample(c->sanity_check,
 			      ts.tv_sec * NS_PER_SEC + ts.tv_nsec)) {
+		filter_reset(c->offset_filter);
 		servo_reset(c->servo);
 	}
 }

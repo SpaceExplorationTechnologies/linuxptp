@@ -29,6 +29,25 @@
 #include "tmv.h"
 #include "transport.h"
 
+/**
+ * Special PHC index values. Index 0 - n are managed by the kernel's PTP
+ * driver stack.
+ */
+#define PHC_INDEX_CLOCK_REALTIME -1
+#define PHC_INDEX_UDS -2
+
+/**
+ * This variable determines the filter type for the input offsets.
+ * Defaults to moving median fitler.
+ */
+extern enum filter_type configured_offset_filter;
+
+/**
+ * This variable determines the length of the filter on the input offsets.
+ * Defaults to 1 (i.e., no filtering).
+ */
+extern int configured_offset_filter_length;
+
 struct ptp_message; /*forward declaration*/
 
 /** Opaque type. */
@@ -61,18 +80,23 @@ UInteger8 clock_class(struct clock *c);
  * Create a clock instance. There can only be one clock in any system,
  * so subsequent calls will destroy the previous clock instance.
  *
- * @param phc_index    PTP hardware clock device to use.
- *                     Pass -1 to select CLOCK_REALTIME.
- * @param ifaces       A queue of network interfaces.
- * @param timestamping The timestamping mode for this clock.
- * @param dds          A pointer to a default data set for the clock.
- * @param servo        The servo that this clock will use.
+ * @param phc_index           PTP hardware clock device to use.
+ *                            Pass -1 to select CLOCK_REALTIME.
+ * @param ifaces              A queue of network interfaces.
+ * @param timestamping        The timestamping mode for this clock.
+ * @param dds                 A pointer to a default data set for the clock.
+ * @param servo               The servo that this clock will use.
+ * @param stats_filename      The file to output clock statistics to (can be NULL).
+ * @param leap_table_filename The filename which contains the leap second table.
+ *                            If NULL, don't use a table.
+ * @param uds_clock_filename  The file to a posix clock device to associate a clock
+ *                            with the UDS port (can be NULL).
  * @return             A pointer to the single global clock instance.
  */
 struct clock *clock_create(int phc_index, struct interfaces_head *ifaces,
 			   enum timestamp_type timestamping, struct default_ds *dds,
-			   enum servo_type servo);
-
+			   enum servo_type servo, const char *stats_filename,
+			   const char *leap_table_filename, const char *uds_clock_filename);
 /**
  * Obtains a clock's default data set.
  * @param c  The clock instance.
@@ -276,5 +300,12 @@ void clock_check_ts(struct clock *c, struct timespec ts);
  * @return   The rate ratio, 1.0 is returned when not known.
  */
 double clock_rate_ratio(struct clock *c);
+
+/**
+ * Obtain the current UTC offset.
+ * @param c  The clock instance.
+ * @return   The current UTC offset.
+ */
+int clock_current_utc_offset(struct clock *c);
 
 #endif

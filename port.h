@@ -34,6 +34,22 @@ struct clock;
 struct port;
 
 /**
+ * Updates the global path_trace for our Best (foreign) Master Clock (BMC).
+ * Call this when you have updated information about the path to the Best
+ * Master Clock (e.g. updated information from master, or falling back to next
+ * best master).
+ *
+ * Both arguments must be valid (not NULL). In other words, this is not useful
+ * if we are becoming grandmaster (we ourselves are BMC) -- in that case, the
+ * path_trace should be cleared instead.
+ *
+ * @param port  A pointer to the port from which we heard about the BMC.
+ * @param msg   A pointer to the latest ANNOUNCE message about the BMC.
+ */
+void port_update_bmc_path_trace(struct port *p,
+				struct ptp_message *m);
+
+/**
  * Returns the dataset from a port's best foreign clock record, if any
  * has yet been discovered. This function does not bring the returned
  * dataset up to date, so the caller should invoke port_compute_best()

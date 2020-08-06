@@ -77,6 +77,13 @@ extern double configured_pi_ki_exponent;
  */
 extern double configured_pi_ki_norm_max;
 
+/**
+ * This variable determines how long (in seconds) we wait to get an initial
+ * linear estimate of the frequency correction we need to apply.
+ * Defaults to -1.0, where the value is determined by ki.
+ */
+extern double configured_pi_init_freq_est_interval;
+
 struct servo *pi_servo_create(int fadj, int sw_ts);
 
 #endif

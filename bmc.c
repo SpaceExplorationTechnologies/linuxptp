@@ -20,6 +20,7 @@
 
 #include "bmc.h"
 #include "ds.h"
+#include "print.h"
 
 #define A_BETTER_TOPO  2
 #define A_BETTER       1
@@ -45,7 +46,7 @@ static int dscmp2(struct dataset *a, struct dataset *b)
 			return A_BETTER;
 		if (diff > 0)
 			return A_BETTER_TOPO;
-		/* error-1 */
+		pr_err("%s: error-%d", __func__, 1);
 		return 0;
 	}
 	if (A > B) {
@@ -54,7 +55,7 @@ static int dscmp2(struct dataset *a, struct dataset *b)
 			return B_BETTER;
 		if (diff > 0)
 			return B_BETTER_TOPO;
-		/* error-1 */
+		pr_err("%s: error-%d", __func__, 1);
 		return 0;
 	}
 
@@ -71,6 +72,7 @@ static int dscmp2(struct dataset *a, struct dataset *b)
 	/*
 	 * If we got this far, it means "error-2" has occured.
 	 */
+	pr_err("%s: error-%d", __func__, 2);
 	return 0;
 }
 

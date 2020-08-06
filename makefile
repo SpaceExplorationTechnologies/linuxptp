@@ -24,9 +24,10 @@ CFLAGS	= -Wall $(VER) $(incdefs) $(DEBUG) $(EXTRA_CFLAGS)
 LDLIBS	= -lm -lrt $(EXTRA_LDFLAGS)
 PRG	= ptp4l pmc phc2sys hwstamp_ctl phc_ctl timemaster
 OBJ     = bmc.o clock.o clockadj.o clockcheck.o config.o fault.o \
- filter.o fsm.o linreg.o mave.o mmedian.o msg.o ntpshm.o phc.o \
+ filter.o fsm.o linreg.o mave.o mmedian.o mmin.o msg.o ntpshm.o phc.o \
  pi.o port.o print.o ptp4l.o raw.o servo.o sk.o stats.o tlv.o \
- transport.o udp.o udp6.o uds.o util.o version.o
+ transport.o udp.o udp6.o uds.o util.o version.o \
+ stats_file.o
 
 OBJECTS	= $(OBJ) hwstamp_ctl.o phc2sys.o phc_ctl.o pmc.o pmc_common.o \
  sysoff.o timemaster.o
@@ -36,6 +37,8 @@ srcdir	:= $(dir $(lastword $(MAKEFILE_LIST)))
 incdefs := $(shell $(srcdir)/incdefs.sh)
 version := $(shell $(srcdir)/version.sh $(srcdir))
 VPATH	= $(srcdir)
+
+LDLIBS += -lgpstime
 
 prefix	= /usr/local
 sbindir	= $(prefix)/sbin
@@ -51,7 +54,8 @@ pmc: msg.o pmc.o pmc_common.o print.o raw.o sk.o tlv.o transport.o udp.o \
 
 phc2sys: clockadj.o clockcheck.o linreg.o msg.o ntpshm.o phc.o phc2sys.o pi.o \
  pmc_common.o print.o raw.o servo.o sk.o stats.o sysoff.o tlv.o \
- transport.o udp.o udp6.o uds.o util.o version.o
+ transport.o udp.o udp6.o uds.o util.o version.o \
+ stats_file.o filter.o mave.o mmedian.o mmin.o
 
 hwstamp_ctl: hwstamp_ctl.o version.o
 
@@ -69,9 +73,9 @@ version.o: .version version.sh $(filter-out version.d,$(DEPEND))
 force:
 
 install: $(PRG)
-	mkdir -p $(sbindir) $(man8dir)
-	install $(PRG) $(sbindir)
-	install -p -m 644 -t $(man8dir) $(PRG:%=%.8)
+	mkdir -p $(DESTDIR)$(sbindir) $(DESTDIR)$(man8dir)
+	install $(PRG) $(DESTDIR)$(sbindir)
+	install -p -m 644 -t $(DESTDIR)$(man8dir) $(PRG:%=%.8)
 
 clean:
 	rm -f $(OBJECTS) $(DEPEND)

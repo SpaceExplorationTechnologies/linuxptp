@@ -26,6 +26,8 @@
 #include "pdt.h"
 
 #define NS_PER_SEC 1000000000LL
+#define NS_PER_HOUR (3600 * NS_PER_SEC)
+#define NS_PER_DAY (24 * NS_PER_HOUR)
 
 /**
  * We implement the time value as a 64 bit signed integer containing

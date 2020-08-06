@@ -50,6 +50,7 @@
 #include "print.h"
 #include "servo.h"
 #include "sk.h"
+#include "stats_file.h"
 #include "stats.h"
 #include "sysoff.h"
 #include "tlv.h"
@@ -84,6 +85,8 @@ struct clock {
 	enum servo_state servo_state;
 	char *device;
 	const char *source_label;
+	const char *stats_filename;
+	char stats_filename_buf[128];
 	struct stats *offset_stats;
 	struct stats *freq_stats;
 	struct stats *delay_stats;
@@ -100,6 +103,7 @@ struct port {
 struct node {
 	unsigned int stats_max_count;
 	int sanity_freq_limit;
+	int max_ppb;
 	enum servo_type servo_type;
 	int phc_readings;
 	double phc_interval;
@@ -124,6 +128,7 @@ static int clock_handle_leap(struct node *node, struct clock *clock,
 			     int64_t offset, uint64_t ts);
 static int run_pmc_get_utc_offset(struct node *node, int timeout);
 static void run_pmc_events(struct node *node);
+static int64_t get_sync_offset(struct node *node, struct clock *dst);
 
 static clockid_t clock_open(char *device)
 {
@@ -158,7 +163,46 @@ static clockid_t clock_open(char *device)
 	return clkid;
 }
 
-static struct clock *clock_add(struct node *node, char *device)
+static void clock_stats_to_file(struct node *node,
+				struct clock *clock, int64_t offset,
+				int64_t delay)
+{
+	struct timespec now;
+	int64_t now_nanoseconds;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	now_nanoseconds = tmv_to_nanoseconds(timespec_to_tmv(now));
+
+	/*
+	 * As in update_clock(), `offset` has the raw offset between
+	 * `node->master` and `clock`. If these clocks are not in the same
+	 * epoch (e.g. UTC versus TAI), correct for that here.
+	 */
+	offset += get_sync_offset(node, clock);
+
+	if (stats_file_print(clock->stats_filename,
+			     "monotonic_timestamp: %" PRId64 "\n"
+			     "master_offset: %" PRId64 "\n"
+			     "servo_state: %d\n"
+			     "freq: %f\n"
+			     "path_delay: %" PRId64 "\n"
+			     "is_node_master: %d\n",
+			     now_nanoseconds,
+			     offset,
+			     clock->servo_state,
+			     clockadj_get_freq(clock->clkid),
+			     delay,
+			     node->master == clock))
+	{
+		/*
+		 * Clear 'stats_filename' on error so that we do not spam.
+		 */
+		clock->stats_filename = NULL;
+	}
+}
+
+static struct clock *clock_add(struct node *node, char *device,
+			       const char *stats_basename)
 {
 	struct clock *c;
 	clockid_t clkid = CLOCK_INVALID;
@@ -221,6 +265,12 @@ static struct clock *clock_add(struct node *node, char *device)
 			return NULL;
 		}
 	}
+	if (node->max_ppb && (max_ppb > node->max_ppb)) {
+		pr_info("driver allows %d ppb adjustment; lowering to "
+			"configured limit of %d ppb",
+			max_ppb, node->max_ppb);
+		max_ppb = node->max_ppb;
+	}
 
 	c->servo = servo_create(node->servo_type, -ppb, max_ppb, 0);
 	servo_sync_interval(c->servo, node->phc_interval);
@@ -229,6 +279,40 @@ static struct clock *clock_add(struct node *node, char *device)
 		c->sysoff_supported = (SYSOFF_SUPPORTED ==
 				       sysoff_probe(CLOCKID_TO_FD(clkid),
 						    node->phc_readings));
+
+	if (stats_basename) {
+		int len;
+		const char *device_name_to_append = strrchr(device, '/');
+
+		/* If strrchr() returned non-NULL, then there is a slash.
+		 * Point to the first character after it.
+		 * Otherwise, use full device name.
+		 */
+		if (device_name_to_append)
+			device_name_to_append += 1;
+		else
+			device_name_to_append = device;
+
+		len = snprintf(c->stats_filename_buf,
+			       sizeof(c->stats_filename_buf), "%s%s",
+			       stats_basename, device_name_to_append);
+		if (len < 0) {
+			pr_err("stats filename snprintf() error");
+			return NULL;
+		} else if ((size_t) len >= sizeof(c->stats_filename_buf)) {
+			pr_err("stats filename too long");
+			return NULL;
+		}
+		c->stats_filename = c->stats_filename_buf;
+
+		/* Finally, create the statistics file (if desired);
+		 * this way, the file is always present.
+		 * We use -1 as sentinel value here for "unknown" (see also
+		 * the system_housekeeping_monitor file_backed_devices
+		 * templates for phc2sys).
+		 */
+		clock_stats_to_file(node, c, -1, -1);
+	}
 
 	LIST_INSERT_HEAD(&node->clocks, c, list);
 	return c;
@@ -246,7 +330,7 @@ static struct port *port_get(struct node *node, unsigned int number)
 }
 
 static struct port *port_add(struct node *node, unsigned int number,
-			     char *device)
+			     char *device, const char *stats_basename)
 {
 	struct port *p;
 	struct clock *c = NULL, *tmp;
@@ -263,7 +347,7 @@ static struct port *port_add(struct node *node, unsigned int number,
 		}
 	}
 	if (!c) {
-		c = clock_add(node, device);
+		c = clock_add(node, device, stats_basename);
 		if (!c)
 			return NULL;
 	}
@@ -411,7 +495,9 @@ static int64_t get_sync_offset(struct node *node, struct clock *dst)
 	int direction = node->forced_sync_offset;
 
 	if (!direction)
-		direction = dst->is_utc - node->master->is_utc;
+		/* Before choosing a master, node->master will be NULL. */
+		if (node->master)
+			direction = dst->is_utc - node->master->is_utc;
 	return (int64_t)dst->sync_offset * NS_PER_SEC * direction;
 }
 
@@ -574,8 +660,170 @@ static int do_pps_loop(struct node *node, struct clock *clock, int fd)
 		if (update_pmc(node, 0) < 0)
 			continue;
 		update_clock(node, clock, pps_offset, pps_ts, -1);
+		clock_stats_to_file(node, clock, pps_offset, -1);
 	}
 	close(fd);
+	return 0;
+}
+
+static int get_and_check_time(clockid_t src, struct timespec *ts)
+{
+	if (clock_gettime(src, ts)) {
+		pr_err("failed to read the time from the master: %m");
+		return -1;
+	}
+
+	if (ts->tv_sec < 0 || ts->tv_nsec < 0 ||
+		   (ts->tv_sec == 0 && ts->tv_nsec == 0)) {
+		pr_err("read an invalid time from the master");
+		return -1;
+	}
+
+	return 0;
+}
+
+/**
+ * Read a latched timestamp from the high speed sampler/clock driver.
+ *
+ * @see https://rtm.spacex.corp/docs/flight-software-design/en/latest/platform/drivers/high_speed_sampler_driver.html
+ *
+ * @param[in] clock hardware clock to read
+ * @param[out] out_ns output value in nanoseconds
+ *
+ * @return 0 on success, negative error value on failure.
+ */
+static int read_latched_timestamp(const struct clock *clock, uint64_t *out_ns)
+{
+	int fd = CLOCKID_TO_FD(clock->clkid);
+	ssize_t ret;
+
+	ret = read(fd, out_ns, sizeof(*out_ns));
+
+	if (ret < 0) {
+		pr_warning("failed to read latched time from %s: %m",
+			   clock->device);
+		return -errno;
+	} else if (ret != sizeof(*out_ns)) {
+		/* unexpected: our drivers always return 64 bits */
+		pr_warning("incompletely read latched time from %s",
+			   clock->device);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+#define ALARM_TIME_BUFSZ 64
+#define ALARM_INTERVAL 1 /* in seconds */
+
+static int do_alarm_loop(struct node *node, int alarm_fd)
+{
+	struct timespec alarm_ts = {};
+	time_t alarm_time = 0;
+	const clockid_t src = node->master->clkid;
+
+	while (is_running()) {
+		int ret = -1;
+		int len = 0;
+		struct pollfd pollfd[1] = {};
+		char buf[ALARM_TIME_BUFSZ] = {};
+		const int timeout = (ALARM_INTERVAL + 1) * 1000; /* in milliseconds */
+
+		/* Read the alarm device to clear any events. */
+		if (read(alarm_fd, buf, ALARM_TIME_BUFSZ) < 0) {
+			pr_err("failed to clear the alarm: %m");
+			return -2;
+		}
+
+		if (alarm_time == 0) {
+			/* The alarm time is uninitialized. Read the current
+			 * time from the clock that will generate the alarms.
+			 * */
+			if (get_and_check_time(src, &alarm_ts) < 0) {
+				return -2;
+			}
+
+			/* Round up to the next whole second (discarding the
+			 * nanoseconds). */
+			alarm_time = alarm_ts.tv_sec + 1;
+		}
+
+		/* Set the alarm to expire after the next interval. */
+		alarm_time += ALARM_INTERVAL;
+
+		ret = snprintf(buf, ALARM_TIME_BUFSZ, "%ld 0", (long)alarm_time);
+		if (ret < 0) {
+			pr_err("failed to format the alarm time: %m");
+			return -2;
+
+		} else if (ret >= ALARM_TIME_BUFSZ) {
+			pr_err("incompletely formatted alarm time");
+			return -2;
+		}
+
+
+		len = ret;
+		ret = write(alarm_fd, buf, len);
+
+		if (ret < 0) {
+			pr_err("failed write the alarm time: %m");
+			return -2;
+
+		} else if (ret != len) {
+			pr_err("incompletely written alarm time: %m");
+			return -2;
+		}
+
+		/* Wait for the alarm to fire. */
+		pollfd[0].fd = alarm_fd;
+		pollfd[0].events = POLLPRI;
+
+		ret = poll(pollfd, 1, timeout);
+		if (ret < 0) {
+			pr_err("poll failed");
+			return -2;
+
+		} else if (!ret) {
+			pr_notice("missed alarm");
+
+			/* The clock might have jumped forward or backward.
+			 * Clear the alarm time to start again one full
+			 * interval from now. */
+			alarm_time = 0;
+
+		} else if (!(pollfd[0].revents & POLLPRI)) {
+			pr_warning("poll unexpected event");
+
+			 /* Clear the alarm time to start again one full
+			  * interval from now. */
+			alarm_time = 0;
+
+		} else {
+			uint64_t alarm_ns = alarm_time * NS_PER_SEC;
+			struct clock *clock = NULL;
+
+			LIST_FOREACH(clock, &node->clocks, list) {
+				if (clock->clkid != src) {
+					uint64_t slave_ns = 0;
+					int64_t offset;
+
+					ret = read_latched_timestamp(
+						clock, &slave_ns);
+					if (ret != 0)
+						continue;
+
+					/* Update the clock servo. */
+					offset = slave_ns - alarm_ns;
+					update_clock(node, clock, offset, slave_ns, -1);
+					clock_stats_to_file(node,
+							    clock,
+							    offset,
+							    -1);
+				}
+			}
+		}
+	}
+	close(alarm_fd);
 	return 0;
 }
 
@@ -593,6 +841,78 @@ static int update_needed(struct clock *c)
 	case PS_SLAVE:
 		break;
 	}
+	return 0;
+}
+
+/**
+ * Use a GPIO pulse to latch src + one or more dst clocks.
+ *
+ * @param node structure representing our system
+ * @param gpio_pulse_fd file descriptor for GPIO value
+ *
+ * @return 0 on successful termination of the program
+ */
+static int do_gpio_pulse_loop(struct node *node, int gpio_pulse_fd)
+{
+	static const char gpio_hi[] = "1\n";
+	static const char gpio_lo[] = "0\n";
+	static const struct timespec microsecond = {
+		.tv_sec = 0,
+		.tv_nsec = 1000,
+	};
+	struct timespec interval;
+
+	interval.tv_sec = node->phc_interval;
+	interval.tv_nsec = (node->phc_interval - interval.tv_sec) * 1e9;
+
+	while (is_running()) {
+		struct clock *clock;
+		uint64_t src_ns = 0;
+		ssize_t ret;
+
+		clock_nanosleep(CLOCK_MONOTONIC, 0, &interval, NULL);
+
+		/* Pulse GPIO. */
+		ret = write(gpio_pulse_fd, gpio_hi, sizeof(gpio_hi) - 1);
+		if (ret < 0) {
+			pr_warning("failed to write GPIO lo->hi edge: %m");
+			break;
+		} else if (ret != sizeof(gpio_hi) - 1) {
+			pr_warning("incompletely written GPIO lo->hi edge");
+			break;
+		}
+		/* Wait at least a microsecond for hardware to detect edge. */
+		clock_nanosleep(CLOCK_MONOTONIC, 0, &microsecond, NULL);
+		ret = write(gpio_pulse_fd, gpio_lo, sizeof(gpio_lo) - 1);
+		if (ret < 0) {
+			pr_warning("failed to write GPIO hi->lo edge: %m");
+			break;
+		} else if (ret != sizeof(gpio_lo) - 1) {
+			pr_warning("incompletely written GPIO hi->lo edge");
+			break;
+		}
+
+		/* Read source time. */
+		ret = read_latched_timestamp(node->master, &src_ns);
+		if (ret != 0)
+			continue;
+
+		LIST_FOREACH(clock, &node->clocks, list) {
+			uint64_t dst_ns = 0;
+			int64_t offset;
+
+			/* Read destination time. */
+			ret = read_latched_timestamp(clock, &dst_ns);
+			if (ret != 0)
+				continue;
+			offset = dst_ns - src_ns;
+
+			if (update_needed(clock))
+				update_clock(node, clock, offset, dst_ns, -1);
+			clock_stats_to_file(node, clock, offset, -1);
+		}
+	}
+	close(gpio_pulse_fd);
 	return 0;
 }
 
@@ -627,9 +947,6 @@ static int do_loop(struct node *node, int subscriptions)
 			continue;
 
 		LIST_FOREACH(clock, &node->clocks, list) {
-			if (!update_needed(clock))
-				continue;
-
 			if (clock->clkid == CLOCK_REALTIME &&
 			    node->master->sysoff_supported) {
 				/* use sysoff */
@@ -644,7 +961,9 @@ static int do_loop(struct node *node, int subscriptions)
 					      &offset, &ts, &delay))
 					continue;
 			}
-			update_clock(node, clock, offset, ts, delay);
+			if (update_needed(clock))
+				update_clock(node, clock, offset, ts, delay);
+			clock_stats_to_file(node, clock, offset, delay);
 		}
 	}
 	return 0;
@@ -752,7 +1071,7 @@ static int recv_subscribed(struct node *node, struct ptp_message *msg,
 			port->state = state;
 			clock = port->clock;
 			state = clock_compute_state(node, clock);
-			if (clock->state != state) {
+			if (clock->state != state || clock->new_state) {
 				clock->new_state = state;
 				node->state_changed = 1;
 			}
@@ -1013,23 +1332,27 @@ static void close_pmc(struct node *node)
 	node->pmc = NULL;
 }
 
-static int auto_init_ports(struct node *node, int add_rt)
+static int auto_init_ports(struct node *node, int add_rt,
+			   const char *stats_basename,
+			   const char *uds_clock_filename)
 {
 	struct port *port;
 	struct clock *clock;
 	int number_ports, res;
-	unsigned int i;
-	int state, timestamping;
+	unsigned int i, start_port;
+	int state = 0;
+	int timestamping = 0;
 	char iface[IFNAMSIZ];
 
 	while (1) {
 		res = run_pmc_clock_identity(node, 1000);
-		if (res < 0)
+		if (res < 0) {
+			pr_err("failed to get clock identity");
 			return -1;
+		}
 		if (res > 0)
 			break;
 		/* res == 0, timeout */
-		pr_notice("Waiting for ptp4l...");
 	}
 
 	number_ports = run_pmc_get_number_ports(node, 1000);
@@ -1044,7 +1367,9 @@ static int auto_init_ports(struct node *node, int add_rt)
 		return -1;
 	}
 
-	for (i = 1; i <= number_ports; i++) {
+	/* If a UDS clock is specified, start with port zero (UDS). */
+	start_port = uds_clock_filename ? 0 : 1;
+	for (i = start_port; i <= number_ports; i++) {
 		res = run_pmc_port_properties(node, 1000, i, &state,
 					      &timestamping, iface);
 		if (res == -1) {
@@ -1059,7 +1384,13 @@ static int auto_init_ports(struct node *node, int add_rt)
 			/* ignore ports with software time stamping */
 			continue;
 		}
-		port = port_add(node, i, iface);
+
+		/* Override device name with clock name if UDS. */
+		if (i == 0 && uds_clock_filename) {
+			strncpy(iface, uds_clock_filename, IFNAMSIZ);
+		}
+
+		port = port_add(node, i, iface, stats_basename);
 		if (!port)
 			return -1;
 		port->state = normalize_state(state);
@@ -1074,7 +1405,7 @@ static int auto_init_ports(struct node *node, int add_rt)
 	node->state_changed = 1;
 
 	if (add_rt) {
-		clock = clock_add(node, "CLOCK_REALTIME");
+		clock = clock_add(node, "CLOCK_REALTIME", stats_basename);
 		if (!clock)
 			return -1;
 		if (add_rt == 1)
@@ -1181,8 +1512,11 @@ static void usage(char *progname)
 		" -r             synchronize system (realtime) clock\n"
 		"                repeat -r to consider it also as a time source\n"
 		" manual configuration:\n"
-		" -c [dev|name]  slave clock (CLOCK_REALTIME)\n"
+		" -c [dev|name]  slave clock (CLOCK_REALTIME), may be repeated for multiple\n"
+		"                slave clocks\n"
 		" -d [dev]       master PPS device\n"
+		" -D [file]      master alarm control (a path under sysfs)\n"
+		" -g [file]      GPIO pulse file to latch master and slaves\n"
 		" -s [dev|name]  master clock\n"
 		" -O [offset]    slave-master time offset (0)\n"
 		" -w             wait for ptp4l\n"
@@ -1200,9 +1534,16 @@ static void usage(char *progname)
 		" -n [num]       domain number (0)\n"
 		" -x             apply leap seconds by servo instead of kernel\n"
 		" -z [path]      server address for UDS (/var/run/ptp4l)\n"
+		" -f [limit]     max freq change (in ppb) for slave clock\n"
+		"                (0 == use driver's reported max)\n"
 		" -l [num]       set the logging level to 'num' (6)\n"
 		" -m             print messages to stdout\n"
 		" -q             do not print messages to the syslog\n"
+		" -t [file]      base name of files for time-setting statistics\n"
+		"                for each slave clock (specified with '-c' or\n"
+		"                implicitly with '-a')\n"
+		" -T [file]      name of *temporary* file for '-t' atomic updates\n"
+		" -U [file]      name of the clock device to associate with UDS\n"
 		" -v             prints the software version and exits\n"
 		" -h             prints this message and exits\n"
 		"\n",
@@ -1211,11 +1552,18 @@ static void usage(char *progname)
 
 int main(int argc, char *argv[])
 {
+#define DST_MAX_COUNT 2
 	char *progname;
-	char *src_name = NULL, *dst_name = NULL;
-	struct clock *src, *dst;
+	char *src_name = NULL;
+	char *dst_names[DST_MAX_COUNT] = {};
+	int dst_count = 0;
+	const char *stats_basename = NULL;
+	const char *uds_clock_filename = NULL;
+	struct clock *src = NULL;
+	struct clock *realtime_dst = NULL;
 	int autocfg = 0, rt = 0;
-	int c, domain_number = 0, pps_fd = -1;
+	int c, domain_number = 0, pps_fd = -1, alarm_fd = -1;
+	int gpio_pulse_fd = -1;
 	int r, wait_sync = 0;
 	int print_level = LOG_INFO, use_syslog = 1, verbose = 0;
 	double phc_rate;
@@ -1236,7 +1584,7 @@ int main(int argc, char *argv[])
 	progname = strrchr(argv[0], '/');
 	progname = progname ? 1+progname : argv[0];
 	while (EOF != (c = getopt(argc, argv,
-				  "arc:d:s:E:P:I:S:F:R:N:O:L:M:i:u:wn:xz:l:mqvh"))) {
+				  "arc:d:D:g:s:E:P:I:S:F:R:N:O:L:M:i:u:wn:xz:f:l:mqt:T:U:vh"))) {
 		switch (c) {
 		case 'a':
 			autocfg = 1;
@@ -1245,7 +1593,14 @@ int main(int argc, char *argv[])
 			rt++;
 			break;
 		case 'c':
-			dst_name = strdup(optarg);
+			if (dst_count < DST_MAX_COUNT) {
+				dst_names[dst_count] = strdup(optarg);
+				dst_count++;
+			} else {
+				fprintf(stderr,
+					"ignoring slave '%s' (only %d allowed)\n",
+					optarg, DST_MAX_COUNT);
+			}
 			break;
 		case 'd':
 			pps_fd = open(optarg, O_RDONLY);
@@ -1255,11 +1610,32 @@ int main(int argc, char *argv[])
 				return -1;
 			}
 			break;
+		case 'D':
+			alarm_fd = open(optarg, O_RDWR);
+			if (alarm_fd < 0) {
+				fprintf(stderr,
+					"cannot open '%s': %m\n", optarg);
+				return -1;
+			}
+			break;
+		case 'g':
+			gpio_pulse_fd = open(optarg, O_RDWR);
+			if (gpio_pulse_fd < 0) {
+				fprintf(stderr,
+					"cannot open '%s': %m\n", optarg);
+				return -1;
+			}
+			break;
 		case 'i':
 			fprintf(stderr,
 				"'-i' has been deprecated. please use '-s' instead.\n");
 		case 's':
-			src_name = strdup(optarg);
+			if (!src_name) {
+				src_name = strdup(optarg);
+			} else {
+				fprintf(stderr,
+					"ignoring extra master '%s'\n", optarg);
+			}
 			break;
 		case 'E':
 			if (!strcasecmp(optarg, "pi")) {
@@ -1340,6 +1716,11 @@ int main(int argc, char *argv[])
 			}
 			strncpy(uds_path, optarg, MAX_IFNAME_SIZE);
 			break;
+		case 'f':
+			if (get_arg_val_i(c, optarg, &node.max_ppb,
+					  0, INT_MAX))
+				return -1;
+			break;
 		case 'l':
 			if (get_arg_val_i(c, optarg, &print_level,
 					  PRINT_LEVEL_MIN, PRINT_LEVEL_MAX))
@@ -1350,6 +1731,15 @@ int main(int argc, char *argv[])
 			break;
 		case 'q':
 			use_syslog = 0;
+			break;
+		case 't':
+			stats_basename = optarg;
+			break;
+		case 'T':
+			stats_file_set_temp_filename(optarg);
+			break;
+		case 'U':
+			uds_clock_filename = optarg;
 			break;
 		case 'v':
 			version_show(stdout);
@@ -1362,7 +1752,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (autocfg && (src_name || dst_name || pps_fd >= 0 || wait_sync || node.forced_sync_offset)) {
+	if (autocfg && (src_name || dst_count > 0 || pps_fd >= 0 || alarm_fd >= 0 || gpio_pulse_fd >= 0 || wait_sync || node.forced_sync_offset)) {
 		fprintf(stderr,
 			"autoconfiguration cannot be mixed with manual config options.\n");
 		goto bad_usage;
@@ -1379,6 +1769,12 @@ int main(int argc, char *argv[])
 		goto bad_usage;
 	}
 
+	if (!autocfg && uds_clock_filename) {
+		fprintf(stderr,
+			"explicit uds clock device requires autoconfig using -a\n");
+		goto bad_usage;
+	}
+
 	if (node.servo_type == CLOCK_SERVO_NTPSHM) {
 		node.kernel_leap = 0;
 		node.sanity_freq_limit = 0;
@@ -1392,13 +1788,13 @@ int main(int argc, char *argv[])
 	if (autocfg) {
 		if (init_pmc(&node, domain_number))
 			return -1;
-		if (auto_init_ports(&node, rt) < 0)
+		if (auto_init_ports(&node, rt, stats_basename, uds_clock_filename) < 0)
 			return -1;
 		r = do_loop(&node, 1);
 		goto end;
 	}
 
-	src = clock_add(&node, src_name);
+	src = clock_add(&node, src_name, NULL);
 	free(src_name);
 	if (!src) {
 		fprintf(stderr,
@@ -1408,19 +1804,35 @@ int main(int argc, char *argv[])
 	src->state = PS_SLAVE;
 	node.master = src;
 
-	dst = clock_add(&node, dst_name ? dst_name : "CLOCK_REALTIME");
-	free(dst_name);
-	if (!dst) {
-		fprintf(stderr,
-			"valid destination clock must be selected.\n");
-		goto bad_usage;
-	}
-	dst->state = PS_MASTER;
+	if (dst_count > 0) {
+		int i = 0;
+		struct clock *dst = NULL;
 
-	if (pps_fd >= 0 && dst->clkid != CLOCK_REALTIME) {
-		fprintf(stderr,
-			"cannot use a pps device unless destination is CLOCK_REALTIME\n");
-		goto bad_usage;
+		for (; i < dst_count; i++) {
+			dst = clock_add(&node, dst_names[i], stats_basename);
+			free(dst_names[i]);
+			dst_names[i] = NULL;
+
+			if (!dst) {
+				fprintf(stderr,
+					"valid destination clock must be "
+					"selected.\n");
+				goto bad_usage;
+			}
+			if (dst->clkid == CLOCK_REALTIME) {
+				realtime_dst = dst;
+			}
+			dst->state = PS_MASTER;
+		}
+	} else {
+		realtime_dst = clock_add(&node, "CLOCK_REALTIME",
+					 stats_basename);
+		if (!realtime_dst) {
+			fprintf(stderr,
+				"failed to open CLOCK_REALTIME.\n");
+			goto bad_usage;
+		}
+		realtime_dst->state = PS_MASTER;
 	}
 
 	r = -1;
@@ -1431,12 +1843,13 @@ int main(int argc, char *argv[])
 
 		while (is_running()) {
 			r = run_pmc_wait_sync(&node, 1000);
-			if (r < 0)
+			if (r < 0) {
+				pr_err("failed to get clock state");
 				goto end;
+			}
+
 			if (r > 0)
 				break;
-			else
-				pr_notice("Waiting for ptp4l...");
 		}
 
 		if (!node.forced_sync_offset) {
@@ -1448,16 +1861,40 @@ int main(int argc, char *argv[])
 		}
 
 		if (node.forced_sync_offset ||
-		    (src->clkid != CLOCK_REALTIME && dst->clkid != CLOCK_REALTIME) ||
+		    (src->clkid != CLOCK_REALTIME && !realtime_dst) ||
 		    src->clkid == CLOCK_INVALID)
 			close_pmc(&node);
 	}
 
 	if (pps_fd >= 0) {
-		/* only one destination clock allowed with PPS until we
-		 * implement a mean to specify PTP port to PPS mapping */
-		servo_sync_interval(dst->servo, 1.0);
-		r = do_pps_loop(&node, dst, pps_fd);
+		if (!realtime_dst || dst_count > 1) {
+			fprintf(stderr,
+				"a pps device can only synchronize CLOCK_REALTIME\n");
+			goto bad_usage;
+		}
+		/* only CLOCK_REALTIME is allowed with PPS until we implement a
+		 * means to specify PTP port to PPS mapping */
+		servo_sync_interval(realtime_dst->servo, 1.0);
+		r = do_pps_loop(&node, realtime_dst, pps_fd);
+
+	} else if (alarm_fd >= 0) {
+		if (realtime_dst) {
+			fprintf(stderr,
+				"an alarm master can only synchronize hardware"
+				" slave clocks\n");
+			goto bad_usage;
+		}
+		r = do_alarm_loop(&node, alarm_fd);
+
+	} else if (gpio_pulse_fd >= 0) {
+		if (realtime_dst) {
+			fprintf(stderr,
+				"gpio pulse can only synchronize hardware"
+				" clocks\n");
+			goto bad_usage;
+		}
+		r = do_gpio_pulse_loop(&node, gpio_pulse_fd);
+
 	} else {
 		r = do_loop(&node, 0);
 	}

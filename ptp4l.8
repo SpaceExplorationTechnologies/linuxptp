@@ -76,6 +76,10 @@ used.
 .B \-s
 Enable the slaveOnly mode.
 .TP
+.B \-Z " leap-table"
+In grandmaster mode, determine the UTC offset and leap second status from a
+leap second table instead of hard-coding a stale UTC offset.
+.TP
 .BI \-l " print-level"
 Set the maximum syslog level of messages which should be printed or sent to
 the system logger. The default is 6 (LOG_INFO).
@@ -162,6 +166,13 @@ The default is 0.
 .B path_trace_enabled
 Enable the mechanism used to trace the route of the Announce messages.
 The default is 0 (disabled).
+.B sync_on_carrier_down
+If enabled, ptp4l will not fault out the port if `port_tx_announce()`
+or `port_tx_sync()` fails. While the send itself succeeds, trying to
+read the TX HW timestamp will fail (since it never actually sent,
+because link was down).
+Unfortunately, phc2sys will see this faulted state and refuse to steer
+the port's PHC. So we really want to keep the port happy.
 .TP
 .B follow_up_info
 Include the 802.1AS data in the Follow_Up messages if enabled.
@@ -199,12 +210,31 @@ smaller than this value the port is marked as not 802.1AS capable.
 .TP
 .B delay_filter
 Select the algorithm used to filter the measured delay and peer delay. Possible
-values are moving_average and moving_median.
+values are moving_average, moving_median, and moving_minimum.
 The default is moving_median.
 .TP
 .B delay_filter_length
 The length of the delay filter in samples.
 The default is 10.
+.TP
+.B offset_filter
+Select the algorithm used to filter the measured master offset. Possible
+values are moving_average, moving_median, and moving_minimum.
+The default is moving_median.
+.TP
+.B offset_filter_length
+The length of the offset filter in samples.
+The default is 10.
+.TP
+.B min_filter_start
+This defines the low end of the range of values to average when evaluating the
+moving minimum filter. This value applies to all moving_minimum filters.
+The default is 0 (include the minimum value)
+.TP
+.B min_filter_stop
+This defines the upper end of the range of values to average when evaluating
+the moving minimum filter. This value applies to all moving_minimum filters.
+The default is 0 (include only the minimum value)
 .TP
 .B egressLatency
 Specifies the difference in nanoseconds between the actual transmission

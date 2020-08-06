@@ -18,19 +18,23 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <linux/net_tstamp.h>
 
 #include "clock.h"
 #include "config.h"
+#include "mmin.h"
 #include "ntpshm.h"
 #include "pi.h"
 #include "print.h"
 #include "raw.h"
 #include "sk.h"
+#include "stats_file.h"
 #include "transport.h"
 #include "udp6.h"
 #include "uds.h"
@@ -87,6 +91,7 @@ static struct config cfg_settings = {
 		.syncReceiptTimeout = 0,
 		.transportSpecific = 0,
 		.announce_span = 1,
+		.sync_interval_addend_ns = 0,
 		.path_trace_enabled = 0,
 		.follow_up_info = 0,
 		.freq_est_interval = 1,
@@ -110,6 +115,10 @@ static struct config cfg_settings = {
 	.step_threshold = &servo_step_threshold,
 	.first_step_threshold = &servo_first_step_threshold,
 	.max_frequency = &servo_max_frequency,
+	.offset_filter = &configured_offset_filter,
+	.offset_filter_length = &configured_offset_filter_length,
+	.min_filter_start = &configured_mmin_start,
+	.min_filter_stop = &configured_mmin_stop,
 
 	.pi_proportional_const = &configured_pi_kp,
 	.pi_integral_const = &configured_pi_ki,
@@ -119,6 +128,7 @@ static struct config cfg_settings = {
 	.pi_integral_scale = &configured_pi_ki_scale,
 	.pi_integral_exponent = &configured_pi_ki_exponent,
 	.pi_integral_norm_max = &configured_pi_ki_norm_max,
+	.pi_init_freq_est_interval = &configured_pi_init_freq_est_interval,
 	.ntpshm_segment = &ntpshm_segment,
 
 	.ptp_dst_mac = ptp_dst_mac,
@@ -150,6 +160,8 @@ static void usage(char *progname)
 		" -S        SOFTWARE\n"
 		" -L        LEGACY HW\n\n"
 		" Other Options\n\n"
+		" -C [mac]  generate clock id from specified MAC address\n"
+		"           instead of using hardware address.\n"
 		" -f [file] read configuration from 'file'\n"
 		" -i [dev]  interface device to use, for example 'eth0'\n"
 		"           (may be specified multiple times)\n"
@@ -159,6 +171,11 @@ static void usage(char *progname)
 		" -l [num]  set the logging level to 'num'\n"
 		" -m        print messages to stdout\n"
 		" -q        do not print messages to the syslog\n"
+		" -t [file] name of file for time-setting statistics\n"
+		" -T [file] name of *temporary* file for '-t' atomic updates\n"
+		" -U [file] name of the clock device to associate with UDS\n"
+		" -Z [file] name of leap second table for use while grandmaster\n"
+		"           file must be tzdata or USNO-formatted.\n"
 		" -v        prints the software version and exits\n"
 		" -h        prints this message and exits\n"
 		"\n",
@@ -176,7 +193,12 @@ int main(int argc, char *argv[])
 	enum timestamp_type *timestamping = &cfg_settings.timestamping;
 	struct clock *clock;
 	struct defaultDS *ds = &cfg_settings.dds.dds;
-	int phc_index = -1, required_modes = 0;
+	int phc_index = PHC_INDEX_CLOCK_REALTIME, required_modes = 0;
+	const char *stats_filename = NULL;
+	const char *leap_table_filename = NULL;
+	const char *sx_init_gated;
+	const char *uds_clock_filename = NULL;
+	const char *clock_id = NULL;
 
 	if (handle_term_signals())
 		return -1;
@@ -190,7 +212,7 @@ int main(int argc, char *argv[])
 	/* Process the command line arguments. */
 	progname = strrchr(argv[0], '/');
 	progname = progname ? 1+progname : argv[0];
-	while (EOF != (c = getopt(argc, argv, "AEP246HSLf:i:p:sl:mqvh"))) {
+	while (EOF != (c = getopt(argc, argv, "AEP246HSLC:f:i:p:sl:mqt:T:U:Z:vh"))) {
 		switch (c) {
 		case 'A':
 			*dm = DM_AUTO;
@@ -228,6 +250,9 @@ int main(int argc, char *argv[])
 			*timestamping = TS_LEGACY_HW;
 			*cfg_ignore |= CFG_IGNORE_TIMESTAMPING;
 			break;
+		case 'C':
+			clock_id = optarg;
+			break;
 		case 'f':
 			config = optarg;
 			break;
@@ -255,6 +280,18 @@ int main(int argc, char *argv[])
 		case 'q':
 			cfg_settings.use_syslog = 0;
 			*cfg_ignore |= CFG_IGNORE_USE_SYSLOG;
+			break;
+		case 't':
+			stats_filename = optarg;
+			break;
+		case 'T':
+			stats_file_set_temp_filename(optarg);
+			break;
+		case 'U':
+			uds_clock_filename = optarg;
+			break;
+		case 'Z':
+			leap_table_filename = optarg;
 			break;
 		case 'v':
 			version_show(stdout);
@@ -304,6 +341,7 @@ int main(int argc, char *argv[])
 		switch (*timestamping) {
 		case TS_SOFTWARE:
 		case TS_LEGACY_HW:
+		case TS_LEGACY_SW:
 			fprintf(stderr, "one step is only possible "
 				"with hardware time stamping\n");
 			return -1;
@@ -332,6 +370,9 @@ int main(int argc, char *argv[])
 			SOF_TIMESTAMPING_RX_HARDWARE |
 			SOF_TIMESTAMPING_RAW_HARDWARE;
 		break;
+	case TS_LEGACY_SW:
+		/* No required modes for this. */
+		break;
 	}
 
 	/* Init interface configs and check whether timestamping mode is
@@ -350,9 +391,11 @@ int main(int argc, char *argv[])
 	/* determine PHC Clock index */
 	iface = STAILQ_FIRST(&cfg_settings.interfaces);
 	if (cfg_settings.dds.free_running) {
-		phc_index = -1;
-	} else if (*timestamping == TS_SOFTWARE || *timestamping == TS_LEGACY_HW) {
-		phc_index = -1;
+		phc_index = PHC_INDEX_CLOCK_REALTIME;
+	} else if (*timestamping == TS_SOFTWARE ||
+		   *timestamping == TS_LEGACY_HW ||
+		   *timestamping == TS_LEGACY_SW) {
+		phc_index = PHC_INDEX_CLOCK_REALTIME;
 	} else if (req_phc) {
 		if (1 != sscanf(req_phc, "/dev/ptp%d", &phc_index)) {
 			fprintf(stderr, "bad ptp device string\n");
@@ -371,17 +414,53 @@ int main(int argc, char *argv[])
 		pr_info("selected /dev/ptp%d as PTP clock", phc_index);
 	}
 
-	if (generate_clock_identity(&ds->clockIdentity, iface->name)) {
+	/* If a clock_id string was specified, use it as the basis for
+	 * the clock id instead of the ethernet controller MAC. Some
+	 * network interfaces don't provide sufficiently system-unique
+	 * MAC addresses, so this allows an override.
+	 */
+	if (clock_id) {
+		unsigned char mac[MAC_LEN];
+		if (str2mac(clock_id, mac)) {
+			fprintf(stderr, "failed to parse clock id\n");
+			return -1;
+		}
+
+		ds->clockIdentity.id[0] = mac[0];
+		ds->clockIdentity.id[1] = mac[1];
+		ds->clockIdentity.id[2] = mac[2];
+		ds->clockIdentity.id[3] = 0xFF;
+		ds->clockIdentity.id[4] = 0xFE;
+		ds->clockIdentity.id[5] = mac[3];
+		ds->clockIdentity.id[6] = mac[4];
+		ds->clockIdentity.id[7] = mac[5];
+	}
+	else if (generate_clock_identity(&ds->clockIdentity, iface->name)) {
 		fprintf(stderr, "failed to generate a clock identity\n");
 		return -1;
 	}
 
 	clock = clock_create(phc_index, &cfg_settings.interfaces,
 			     *timestamping, &cfg_settings.dds,
-			     cfg_settings.clock_servo);
+			     cfg_settings.clock_servo, stats_filename,
+			     leap_table_filename, uds_clock_filename);
 	if (!clock) {
 		fprintf(stderr, "failed to create a clock\n");
 		return -1;
+	}
+
+	/* Wait at the initialization gate. This allows us to create a
+	 * barrier in the runtime file so that processes depending on
+	 * ptp4l wait for its initialization to complete. */
+	sx_init_gated = getenv("SX_INIT_GATED");
+	if (sx_init_gated != NULL && !strcasecmp(sx_init_gated, "true")) {
+		printf("Waiting at the initialization gate.\n");
+		fflush(stdout);
+		/* sxruntime_start will send a SIGCONT to resume the
+		 * process when ready. */
+		kill(getpid(), SIGSTOP);
+		printf("Proceeding past the initialization gate.\n");
+		fflush(stdout);
 	}
 
 	while (is_running()) {

@@ -71,6 +71,8 @@ struct port {
 	int fault_fd;
 	int phc_index;
 	int jbod;
+	int master_has_multi_port;
+	int sync_on_carrier_down;
 	struct foreign_clock *best;
 	enum syfu_state syfu;
 	struct ptp_message *last_syncfup;
@@ -136,6 +138,7 @@ static int announce_compare(struct ptp_message *m1, struct ptp_message *m2)
 }
 
 static void announce_to_dataset(struct ptp_message *m, struct clock *c,
+				const struct PortIdentity *receiver,
 				struct dataset *out)
 {
 	struct announce_msg *a = &m->announce;
@@ -145,7 +148,7 @@ static void announce_to_dataset(struct ptp_message *m, struct clock *c,
 	out->priority2    = a->grandmasterPriority2;
 	out->stepsRemoved = a->stepsRemoved;
 	out->sender       = m->header.sourcePortIdentity;
-	out->receiver     = clock_parent_identity(c);
+	out->receiver     = *receiver;
 }
 
 static int msg_current(struct ptp_message *m, struct timespec now)
@@ -209,7 +212,8 @@ struct fdarray *port_fda(struct port *port)
 	return &port->fda;
 }
 
-int set_tmo_log(int fd, unsigned int scale, int log_seconds)
+static int set_tmo_log_with_addend(int fd, unsigned int scale, int log_seconds,
+				   int addend_ns)
 {
 	struct itimerspec tmo = {
 		{0, 0}, {0, 0}
@@ -224,16 +228,24 @@ int set_tmo_log(int fd, unsigned int scale, int log_seconds)
 			ns >>= 1;
 		}
 		tmo.it_value.tv_nsec = ns;
+		tmo.it_value.tv_nsec += addend_ns;
 
 		while (tmo.it_value.tv_nsec >= NS_PER_SEC) {
 			tmo.it_value.tv_nsec -= NS_PER_SEC;
 			tmo.it_value.tv_sec++;
 		}
 
-	} else
+	} else {
 		tmo.it_value.tv_sec = scale * (1 << log_seconds);
+		tmo.it_value.tv_nsec = addend_ns;
+	}
 
 	return timerfd_settime(fd, 0, &tmo, NULL);
+}
+
+int set_tmo_log(int fd, unsigned int scale, int log_seconds)
+{
+	return set_tmo_log_with_addend(fd, scale, log_seconds, 0);
 }
 
 int set_tmo_lin(int fd, int seconds)
@@ -332,11 +344,31 @@ static void ts_add(struct timespec *ts, int ns)
 	}
 }
 
-static void ts_to_timestamp(struct timespec *src, struct Timestamp *dst)
+/**
+ * reflect_timestamp() - Transform a timestamp, possibly adding the UTC offset
+ *
+ * @p:		the port
+ * @src:	source timestamp
+ * @dst:	destination timestamp
+ *
+ * Many parts of the PTP protocol expect a message sender to reflect
+ * the time it received or sent a previous message. Examples are delay
+ * response and follow-up messages. If we are using software timestamping,
+ * the timestamp from the previous message is in UTC, but the PTP protocol
+ * expects timestamps in TAI. So we add the UTC-to-TAI offset here if
+ * necessary.
+ */
+static void reflect_timestamp(struct port *p, struct timespec *src,
+			      struct Timestamp *dst)
 {
-	dst->seconds_lsb = src->tv_sec;
+	struct timespec ts = *src;
+
+	/* If we're using software timestamping, add the UTC-to-TAI offset. */
+	if (timestamping_is_software(p->timestamping))
+		ts.tv_sec += clock_current_utc_offset(p->clock);
+	dst->seconds_lsb = ts.tv_sec;
 	dst->seconds_msb = 0;
-	dst->nanoseconds = src->tv_nsec;
+	dst->nanoseconds = ts.tv_nsec;
 }
 
 /*
@@ -971,6 +1003,12 @@ static int port_set_manno_tmo(struct port *p)
 
 static int port_set_qualification_tmo(struct port *p)
 {
+	/* If we're a UDS port, we actually *don't* want to transition out
+	 * of port state PS_PRE_MASTER into PS_MASTER. There's nobody
+	 * listening to be synchronized out there. */
+	if (transport_type(p->trp) == TRANS_UDS)
+		return 0;
+
 	return set_tmo_log(p->fda.fd[FD_QUALIFICATION_TIMER],
 		       1+clock_steps_removed(p->clock), p->logAnnounceInterval);
 }
@@ -983,7 +1021,9 @@ static int port_set_sync_rx_tmo(struct port *p)
 
 static int port_set_sync_tx_tmo(struct port *p)
 {
-	return set_tmo_log(p->fda.fd[FD_SYNC_TX_TIMER], 1, p->logSyncInterval);
+	return set_tmo_log_with_addend(p->fda.fd[FD_SYNC_TX_TIMER], 1,
+				       p->logSyncInterval,
+				       p->pod.sync_interval_addend_ns);
 }
 
 static void port_show_transition(struct port *p,
@@ -1187,6 +1227,10 @@ static int port_delay_request(struct port *p)
 		p->peer_delay_fup = NULL;
 	}
 
+	/* If we're a UDS port, don't try to send anything. */
+	if (transport_type(p->trp) == TRANS_UDS)
+		return 0;
+
 	if (p->delayMechanism == DM_P2P)
 		return port_pdelay_request(p);
 
@@ -1235,6 +1279,10 @@ static int port_tx_announce(struct port *p)
 	if (!port_capable(p)) {
 		return 0;
 	}
+	/* If we're a UDS port, don't try to send anything. */
+	if (transport_type(p->trp) == TRANS_UDS)
+		return 0;
+
 	msg = msg_allocate();
 	if (!msg)
 		return -1;
@@ -1283,6 +1331,10 @@ static int port_tx_sync(struct port *p)
 	if (port_sync_incapable(p)) {
 		return 0;
 	}
+	/* If we're a UDS port, don't try to send anything. */
+	if (transport_type(p->trp) == TRANS_UDS)
+		return 0;
+
 	msg = msg_allocate();
 	if (!msg)
 		return -1;
@@ -1338,7 +1390,8 @@ static int port_tx_sync(struct port *p)
 	fup->header.control            = CTL_FOLLOW_UP;
 	fup->header.logMessageInterval = p->logSyncInterval;
 
-	ts_to_timestamp(&msg->hwts.ts, &fup->follow_up.preciseOriginTimestamp);
+	reflect_timestamp(p, &msg->hwts.ts,
+			  &fup->follow_up.preciseOriginTimestamp);
 
 	err = port_prepare_and_send(p, fup, 0);
 	if (err)
@@ -1500,6 +1553,27 @@ static int port_renew_transport(struct port *p)
 	return res;
 }
 
+void port_update_bmc_path_trace(struct port *p,
+				struct ptp_message *m)
+{
+	struct path_trace_tlv *ptt =
+		(struct path_trace_tlv *) m->announce.suffix;
+	struct parent_ds *dad = clock_parent_ds(p->clock);
+
+	/* If we are participating in path tracing and received a valid
+	 * trace, we copy it over. Otherwise, we clear it out --
+	 * other ports might be using path tracing in their ANNOUNCE
+	 * messages, and we don't want to give them bad information. */
+	if (p->pod.path_trace_enabled && (m->tlv_count == 1) &&
+	    (ptt->type == TLV_PATH_TRACE)) {
+		memcpy(dad->ptl, ptt->cid, ptt->length);
+		dad->path_length = path_length(ptt);
+	}
+	else {
+		dad->path_length = 0;
+	}
+}
+
 /*
  * Returns non-zero if the announce message is different than last.
  */
@@ -1507,8 +1581,6 @@ static int update_current_master(struct port *p, struct ptp_message *m)
 {
 	struct foreign_clock *fc = p->best;
 	struct ptp_message *tmp;
-	struct parent_ds *dad;
-	struct path_trace_tlv *ptt;
 	struct timePropertiesDS tds;
 
 	if (!msg_source_equal(m, fc))
@@ -1519,19 +1591,36 @@ static int update_current_master(struct port *p, struct ptp_message *m)
 		tds.flags = m->header.flagField[1];
 		tds.timeSource = m->announce.timeSource;
 		clock_update_time_properties(p->clock, tds);
-	}
-	if (p->pod.path_trace_enabled) {
-		ptt = (struct path_trace_tlv *) m->announce.suffix;
-		dad = clock_parent_ds(p->clock);
-		memcpy(dad->ptl, ptt->cid, ptt->length);
-		dad->path_length = path_length(ptt);
+
+		/* We received an ANNOUNCE message from the foreign_clock
+		 * that is on our best path to the grandmaster (because
+		 * we are in UNCALIBRATED or SLAVE state -- see
+		 * process_announce() and the check above).
+		 * Therefore, we want to update the global path trace list
+		 * (ptl) so that any MASTER ports can pass the tracing
+		 * information on to their peers. */
+		port_update_bmc_path_trace(p, m);
 	}
 	port_set_announce_tmo(p);
 	fc_prune(fc);
 	msg_get(m);
 	fc->n_messages++;
 	TAILQ_INSERT_HEAD(&fc->messages, m, list);
-	if (fc->n_messages > 1) {
+	/* If n_messages is 1, then fc_prune() cleared out all the ANNOUNCE
+	 * messages from our current master (because they were old), and the
+	 * only message there is the one we just added. In that case, we
+	 * force a state decision; we can no longer know whether the master's
+	 * ANNOUNCE information changed.
+	 * Another reason this is appropriate: the number of ANNOUNCE messages
+	 * has dropped below the FOREIGN_MASTER_THRESHOLD, so the current
+	 * master is no longer eligible until we receive enough  messages to
+	 * reach the threshold again.) */
+	if (fc->n_messages == 1) {
+		pr_debug("port %hu: amnesia about foreign master %s",
+			 portnum(p),
+			 pid2str(&m->header.sourcePortIdentity));
+		return 1;
+	} else if (fc->n_messages > 1) {
 		tmp = TAILQ_NEXT(m, list);
 		return announce_compare(m, tmp);
 	}
@@ -1607,7 +1696,7 @@ static int process_delay_req(struct port *p, struct ptp_message *m)
 	msg->header.control            = CTL_DELAY_RESP;
 	msg->header.logMessageInterval = p->logMinDelayReqInterval;
 
-	ts_to_timestamp(&m->hwts.ts, &msg->delay_resp.receiveTimestamp);
+	reflect_timestamp(p, &m->hwts.ts, &msg->delay_resp.receiveTimestamp);
 
 	msg->delay_resp.requestingPortIdentity = m->header.sourcePortIdentity;
 
@@ -1636,8 +1725,20 @@ static void process_delay_resp(struct port *p, struct ptp_message *m)
 		return;
 	if (rsp->hdr.sequenceId != ntohs(req->hdr.sequenceId))
 		return;
-	if (!pid_eq(&master, &m->header.sourcePortIdentity))
+	/* always need to make sure this response is from our master */
+	if (memcmp(&master.clockIdentity,
+		    &m->header.sourcePortIdentity.clockIdentity,
+		    sizeof(master.clockIdentity)) != 0) {
+		pr_debug("delay response not from our master");
 		return;
+	}
+	/* If we expect the response to come from only one port on the master,
+	 * check that as well. */
+	if (!p->master_has_multi_port &&
+	    !pid_eq(&master, &m->header.sourcePortIdentity)) {
+		pr_debug("delay response port mismatch");
+		return;
+	}
 
 	clock_path_delay(p->clock, p->delay_req->hwts.ts, m->ts.pdu,
 			 m->header.correction);
@@ -1747,7 +1848,8 @@ static int process_pdelay_req(struct port *p, struct ptp_message *m)
 	 * NB - We do not have any fraction nanoseconds for the correction
 	 * fields, neither in the response or the follow up.
 	 */
-	ts_to_timestamp(&m->hwts.ts, &rsp->pdelay_resp.requestReceiptTimestamp);
+	reflect_timestamp(p, &m->hwts.ts,
+			  &rsp->pdelay_resp.requestReceiptTimestamp);
 	rsp->pdelay_resp.requestingPortIdentity = m->header.sourcePortIdentity;
 
 	fup->hwts.type = p->timestamping;
@@ -1774,8 +1876,8 @@ static int process_pdelay_req(struct port *p, struct ptp_message *m)
 		goto out;
 	}
 
-	ts_to_timestamp(&rsp->hwts.ts,
-			&fup->pdelay_resp_fup.responseOriginTimestamp);
+	reflect_timestamp(p, &rsp->hwts.ts,
+			  &fup->pdelay_resp_fup.responseOriginTimestamp);
 
 	err = peer_prepare_and_send(p, fup, 0);
 	if (err)
@@ -1991,7 +2093,8 @@ struct foreign_clock *port_compute_best(struct port *p)
 		if (!tmp)
 			continue;
 
-		announce_to_dataset(tmp, p->clock, &fc->dataset);
+		announce_to_dataset(tmp, p->clock, &p->portIdentity,
+				    &fc->dataset);
 
 		fc_prune(fc);
 
@@ -2153,6 +2256,115 @@ int port_dispatch(struct port *p, enum fsm_event event, int mdiff)
 	return 0;
 }
 
+static enum fsm_event process_sx_message(struct port *p,
+					 struct ptp_message *sx_ptp_msg)
+{
+	enum fsm_event event = EV_NONE;
+	struct ptp_message *msg = NULL;
+	const struct sx_message *sx_msg = &sx_ptp_msg->sx_msg;
+	struct ClockIdentity source_clock_identity = clock_identity(p->clock);
+	struct PortIdentity current_parent = clock_parent_identity(p->clock);
+
+	source_clock_identity.id[3] = sx_msg->clock_identifier[0];
+	source_clock_identity.id[4] = sx_msg->clock_identifier[1];
+
+	pr_debug("%s: announceReceiptTimeout %u syncReceiptTimeout %u",
+		 __func__, p->announceReceiptTimeout, p->syncReceiptTimeout);
+	/* Now that we know we have a clock on the other end, make sure a
+	 * timeout is set so that we can fall back to another master.
+	 * The timeouts themselves are enabled in update_current_master()
+	 * and port_synchronize(), respectively. */
+	p->announceReceiptTimeout = 3;
+	p->syncReceiptTimeout = 3;
+
+	/* Only set the path_delay if we are the current parent.
+	 * Otherwise, we muck with somebody else's path_delay estimation! */
+	if (memcmp(&current_parent.clockIdentity, &source_clock_identity,
+		   sizeof(current_parent.clockIdentity)) == 0) {
+		/* Set a path_delay of 0 because the delay in time stamping GPS
+		 * pulses is negligible. */
+		clock_peer_delay(p->clock, 0, 1.0);
+	}
+
+	msg = msg_allocate();
+	if (!msg)
+		return EV_FAULT_DETECTED;
+
+	/* Copy timestamps into the struct ptp_message. */
+	msg->hwts.type = p->timestamping;
+
+	msg->hwts.ts.tv_sec = net2host64(sx_msg->local_clock_timestamp.seconds);
+	msg->hwts.ts.tv_nsec = ntohl(sx_msg->local_clock_timestamp.nanoseconds);
+
+	msg->ts.pdu.sec = net2host64(sx_msg->source_timestamp.seconds);
+	msg->ts.pdu.nsec = ntohl(sx_msg->source_timestamp.nanoseconds);
+
+	/* Create a legitimate-looking SYNC message, but in host byte order
+	 * (just like msg_post_recv() would do). */
+	msg->header.tsmt = SYNC;
+	msg->header.ver = PTP_VERSION;
+	msg->header.messageLength = sizeof(struct sync_msg);
+	msg->header.domainNumber = clock_domain_number(p->clock);
+	if (sx_msg->leap59)
+		msg->header.flagField[1] |= LEAP_59;
+	if (sx_msg->leap61)
+		msg->header.flagField[1] |= LEAP_61;
+	/* NOTE: two_step flag is unset, so this is a one_step sync. */
+	msg->header.flagField[1] |= (UTC_OFF_VALID | PTP_TIMESCALE |
+				     TIME_TRACEABLE | FREQ_TRACEABLE);
+	msg->header.correction = 0;
+	msg->header.sourcePortIdentity.clockIdentity = source_clock_identity;
+	msg->header.sourcePortIdentity.portNumber = 1;
+	/* sequenceId ignored (unchecked) */
+	msg->header.control = CTL_SYNC;
+	msg->header.logMessageInterval = 1;
+	/* We set these to 0 rather than doing the byte-swapping-and-shifting
+	 * of sx_msg->gps_timestamp. Nothing in this file uses them; all the
+	 * code (including process_sync() and process_announce()) assumes that
+	 * the originTimestamp has already been snarfed into msg->ts.pdu by
+	 * msg.c; we did that above. */
+	msg->sync.originTimestamp.seconds_msb = 0;
+	msg->sync.originTimestamp.seconds_lsb = 0;
+	msg->sync.originTimestamp.nanoseconds = 0;
+
+	process_sync(p, msg);
+
+	/* Now create ANNOUNCE message for foreign clock handling. */
+	msg->header.tsmt = ANNOUNCE;
+	msg->header.messageLength = sizeof(struct announce_msg);
+	msg->header.control = CTL_OTHER;
+	msg->announce.currentUtcOffset = ntohs(sx_msg->currentUtcOffset);
+
+	msg->announce.grandmasterPriority1 = sx_msg->grandmasterPriority1;
+	/* 6 == "a clock that is synchronized to a primary reference
+	 *       time source" */
+	msg->announce.grandmasterClockQuality.clockClass =
+		sx_msg->clockClass == 0 ? 6 : sx_msg->clockClass;
+	msg->announce.grandmasterClockQuality.clockAccuracy =
+		sx_msg->clockAccuracy;
+	msg->announce.grandmasterClockQuality.offsetScaledLogVariance =
+		ntohs(sx_msg->offsetScaledLogVariance);
+	msg->announce.grandmasterPriority2 = sx_msg->grandmasterPriority2;
+	msg->announce.grandmasterIdentity = source_clock_identity;
+	msg->announce.stepsRemoved = 0;
+	msg->announce.timeSource = sx_msg->timeSource;
+
+	/* See msg_post_recv() -- the host timestamps the received ANNOUNCE. */
+	clock_gettime(CLOCK_MONOTONIC, &msg->ts.host);
+
+	if (process_announce(p, msg)) {
+		pr_debug("%s requesting state decision", __func__);
+		event = EV_STATE_DECISION_EVENT;
+	}
+
+	/* msg_allocate() (called above) returns a 'struct ptp_message *' with
+	 * a reference count of 1. To free it (if nobody else called msg_get()
+	 * in the meantime), we decrement the reference count using
+	 * msg_put(). */
+	msg_put(msg);
+	return event;
+}
+
 enum fsm_event port_event(struct port *p, int fd_index)
 {
 	enum fsm_event event = EV_NONE;
@@ -2185,12 +2397,16 @@ enum fsm_event port_event(struct port *p, int fd_index)
 	case FD_MANNO_TIMER:
 		pr_debug("port %hu: master tx announce timeout", portnum(p));
 		port_set_manno_tmo(p);
-		return port_tx_announce(p) ? EV_FAULT_DETECTED : EV_NONE;
+		return (port_tx_announce(p) && !p->sync_on_carrier_down) ?
+			EV_FAULT_DETECTED :
+			EV_NONE;
 
 	case FD_SYNC_TX_TIMER:
 		pr_debug("port %hu: master sync timeout", portnum(p));
 		port_set_sync_tx_tmo(p);
-		return port_tx_sync(p) ? EV_FAULT_DETECTED : EV_NONE;
+		return (port_tx_sync(p) && !p->sync_on_carrier_down) ?
+			EV_FAULT_DETECTED :
+			EV_NONE;
 	}
 
 	msg = msg_allocate();
@@ -2205,6 +2421,14 @@ enum fsm_event port_event(struct port *p, int fd_index)
 		msg_put(msg);
 		return EV_FAULT_DETECTED;
 	}
+
+	/* Is it a SpaceX message? */
+	if ((cnt >= 2) && (htons(msg->sx_msg.sx) == 0x7378)) {
+		event = process_sx_message(p, msg);
+		msg_put(msg);
+		return event;
+	}
+
 	err = msg_post_recv(msg, cnt);
 	if (err) {
 		switch (err) {
@@ -2497,12 +2721,16 @@ struct port *port_open(int phc_index,
 
 	p->phc_index = phc_index;
 	p->jbod = interface->boundary_clock_jbod;
+	p->master_has_multi_port = interface->master_has_multi_port;
+	p->sync_on_carrier_down = interface->sync_on_carrier_down;
 
-	if (interface->transport == TRANS_UDS)
-		; /* UDS cannot have a PHC. */
+	if (interface->transport == TRANS_UDS &&
+		interface->ts_info.phc_index != PHC_INDEX_UDS)
+		; /* UDS normally does not have a PHC. */
 	else if (!interface->ts_info.valid)
 		pr_warning("port %d: get_ts_info not supported", number);
-	else if (phc_index >= 0 && phc_index != interface->ts_info.phc_index) {
+	else if (phc_index != PHC_INDEX_CLOCK_REALTIME &&
+			 phc_index != interface->ts_info.phc_index) {
 		if (interface->boundary_clock_jbod) {
 			pr_warning("port %d: just a bunch of devices", number);
 			p->phc_index = interface->ts_info.phc_index;
